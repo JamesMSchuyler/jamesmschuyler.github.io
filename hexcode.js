@@ -1365,11 +1365,14 @@ function evaluateMove(sourceIndex, destIndex) {
  * @param {number} team - The team whose soldier should be converted (PLAYER_TEAM or ENEMY_TEAM).
  * @param {number} newUnitType - The unit type to convert the soldier to (e.g., 2 for archer, 3 for cavalry).
  * @param {string} unitTypeName - The name of the new unit type for logging purposes (e.g., 'archer').
+ * @param {number | null} [excludedZone=null] - A zone number to exclude from the conversion process.
  */
-function _convertRandomSoldier(board, team, newUnitType, unitTypeName) {
+function _convertRandomSoldier(board, team, newUnitType, unitTypeName, excludedZone = null) {
     const soldiers = [];
     for (let i = 0; i < board.length; i++) {
-        if (board[i].team === team && board[i].unit === 1) {
+        // Check the hex's zone from the main `hexagon` array to see if it should be excluded.
+        const hexZone = hexagon[i].zone;
+        if (board[i].team === team && board[i].unit === 1 && hexZone !== excludedZone) {
             soldiers.push(i);
         }
     }
@@ -1381,7 +1384,7 @@ function _convertRandomSoldier(board, team, newUnitType, unitTypeName) {
         console.log(`Converted ${teamName} soldier at hex ${hexIndexToConvert} to a ${unitTypeName}.`);
     } else {
         const teamName = (team === PLAYER_TEAM) ? "player" : "enemy";
-        console.log(`No ${teamName} soldiers found to convert to ${unitTypeName}.`);
+        console.log(`No ${teamName} soldiers found to convert to ${unitTypeName} (excluding zone ${excludedZone}).`);
     }
 }
 /**
@@ -1512,7 +1515,7 @@ function prepareNextLevelBoard(nextLevel, bonusArcher = false) {
         populateTargetZone(nextLevelBoard, targetZoneNum, zoneDominance);
 
         // Generate new units for the outer zones.
-        populateNewOuterZones(nextLevelBoard);
+        populateNewOuterZones(nextLevelBoard, targetZoneNum);
     }
 
     // --- Handle the bonus archer AFTER the board is generated ---
@@ -1597,8 +1600,9 @@ function populateTargetZone(board, targetZone, zoneDominance) {
  * Populates the outer zones of a given board state with new, randomly generated units.
  * This is used when advancing to a level for the first time.
  * @param {Array<{unit: number, team: number}>} board - The board state array to modify.
+ * @param {number} excludedZone - The zone number to exclude from random unit conversion.
  */
-function populateNewOuterZones(board) {
+function populateNewOuterZones(board, excludedZone) {
     console.log(`Generating new board state for outer zones.`);
     const outerZonePlacements = generateOuterZoneUnits();
     for (const [hexIndex, state] of outerZonePlacements.entries()) {
@@ -1606,11 +1610,11 @@ function populateNewOuterZones(board) {
     }
     // Ensure the AI always has at least one archer on a new level.
     if (DIFFICULTY + 1 >= 3) {
-        _convertRandomSoldier(board, ENEMY_TEAM, 2, 'archer');
+        _convertRandomSoldier(board, ENEMY_TEAM, 2, 'archer', excludedZone);
     }
     // Ensure the AI gets a cavalry unit on new levels starting from level 2.
     if (DIFFICULTY + 1 >= 2) {
-        _convertRandomSoldier(board, ENEMY_TEAM, 3, 'cavalry');
+        _convertRandomSoldier(board, ENEMY_TEAM, 3, 'c cavalry', excludedZone);
     }
 }
 
@@ -1664,12 +1668,12 @@ function preload() {
     // in the same directory as your index.html file, and place your
     // sound files there. I'm using placeholder names.
     // You can find free sounds at sites like freesound.org.
-    sounds.boom1 = loadSound('assets/sounds/boom1.wav', soundLoadSuccess, soundLoadError);
-    sounds.boom2 = loadSound('assets/sounds/boom2.wav', soundLoadSuccess, soundLoadError);
-    sounds.select = loadSound('assets/sounds/select.wav', soundLoadSuccess, soundLoadError);
-    sounds.selectEnemy = loadSound('assets/sounds/select_enemy.wav', soundLoadSuccess, soundLoadError);
-    sounds.error = loadSound('assets/sounds/error.wav', soundLoadSuccess, soundLoadError);
-    sounds.move = loadSound('assets/sounds/move.wav', soundLoadSuccess, soundLoadError);
+    sounds.boom1 = loadSound('/ZoomMultiverse/assets/sounds/boom1.wav', soundLoadSuccess, soundLoadError);
+    sounds.boom2 = loadSound('/ZoomMultiverse/assets/sounds/boom2.wav', soundLoadSuccess, soundLoadError);
+    sounds.select = loadSound('/ZoomMultiverse/assets/sounds/select.wav', soundLoadSuccess, soundLoadError);
+    sounds.selectEnemy = loadSound('/ZoomMultiverse/assets/sounds/select_enemy.wav', soundLoadSuccess, soundLoadError);
+    sounds.error = loadSound('/ZoomMultiverse/assets/sounds/error.wav', soundLoadSuccess, soundLoadError);
+    sounds.move = loadSound('/ZoomMultiverse/assets/sounds/move.wav', soundLoadSuccess, soundLoadError);
 }
 
 /**
