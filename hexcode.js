@@ -1668,12 +1668,12 @@ function preload() {
     // in the same directory as your index.html file, and place your
     // sound files there. I'm using placeholder names.
     // You can find free sounds at sites like freesound.org.
-    sounds.boom1 = loadSound('./assets/sounds/boom1.wav', soundLoadSuccess, soundLoadError);
-    sounds.boom2 = loadSound('./assets/sounds/boom2.wav', soundLoadSuccess, soundLoadError);
-    sounds.select = loadSound('./assets/sounds/select.wav', soundLoadSuccess, soundLoadError);
-    sounds.selectEnemy = loadSound('./assets/sounds/select_enemy.wav', soundLoadSuccess, soundLoadError);
-    sounds.error = loadSound('./assets/sounds/error.wav', soundLoadSuccess, soundLoadError);
-    sounds.move = loadSound('./assets/sounds/move.wav', soundLoadSuccess, soundLoadError);
+    sounds.boom1 = loadSound('assets/sounds/boom1.wav', soundLoadSuccess, soundLoadError);
+    sounds.boom2 = loadSound('assets/sounds/boom2.wav', soundLoadSuccess, soundLoadError);
+    sounds.select = loadSound('assets/sounds/select.wav', soundLoadSuccess, soundLoadError);
+    sounds.selectEnemy = loadSound('assets/sounds/select_enemy.wav', soundLoadSuccess, soundLoadError);
+    sounds.error = loadSound('assets/sounds/error.wav', soundLoadSuccess, soundLoadError);
+    sounds.move = loadSound('assets/sounds/move.wav', soundLoadSuccess, soundLoadError);
 }
 
 /**
