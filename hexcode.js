@@ -34,11 +34,12 @@ const DIFFICULTY_LABELS = {
 };
 
 const AI_SCORING_WEIGHTS = {
-    RANDOM_TIEBREAK: 5,
+    RANDOM_TIEBREAK: 45,
     CAVALRY_LONG_MOVE: 10,
     // Score for creating a standard 3-on-1 tactical surround on an enemy unit.
     CREATE_KILL: 100,
     KILL_ARCHER_BONUS: 200,
+    KILL_CAVALRY_BONUS: 75,
     SETUP_KILL: 20,
     DANGEROUS_MOVE: -50,
     // Score per unit eliminated via the special 5-unit zone capture rule.
@@ -74,6 +75,7 @@ let gameState = {
     aiMoveQueue: [],
     aiTurnInitialZones: new Set(), // AI's potential moves for the turn
     aiZonesMovedFromThisTurn: new Set(), // AI's used moves for the turn
+    aiMovesMadeThisTurn: 0, // Number of moves AI has made in its current turn
     introScreenDifficulty: 0, // Difficulty setting for the intro screen
     validMoves: new Set(), // The set of valid destination hex indices for the selected unit
     currentScreen: 'intro', // 'intro', 'instructions', 'game'
@@ -659,26 +661,30 @@ function showStatusMessage() {
  * The message is only shown on the first few turns of a level.
  */
 function drawScoutMessage() {
-    let showMessage = false;
     const movesMade = gameState.zonesMovedFromThisTurn.size;
+    const turnCount = gameState.playerTurnCount;
+    const moveThreshold = 5 - turnCount;
+
+    let showFoundMessage = false;
+    let showLostMessage = false;
 
     // Determine if the message should be shown based on the turn and moves made.
-    if (gameState.playerTurnCount === 1 && movesMade < 4) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 2 && movesMade < 3) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 3 && movesMade < 2) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 4 && movesMade < 1) {
-        showMessage = true;
+    if (turnCount >= 1 && turnCount <= 4) {
+        if (movesMade < moveThreshold) {
+            showFoundMessage = true;
+        } else if (movesMade === moveThreshold) {
+            showLostMessage = true;
+        }
     }
 
     // Only draw if conditions are met and it's the player's turn.
-    if (!showMessage || !gameState.isPlayerTurn || !gameState.secretArcherZone || gameState.level < 4) {
+    if ((!showFoundMessage && !showLostMessage) || !gameState.isPlayerTurn || !gameState.secretArcherZone || gameState.level < 4) {
         return;
     }
 
-    const message = `Your scouts have encountered an archer sympathetic to your cause in the countryside beyond Zone ${gameState.secretArcherZone}.`;
+    const message = showFoundMessage
+        ? `Your scouts have encountered an archer sympathetic to your cause in the countryside beyond Zone ${gameState.secretArcherZone}.`
+        : "Unfortunately, your scouts have lost track of the friendly archer.  Perhaps he will turn up again later.";
     // Position the message vertically below the board.
     const boardBottomY = 200 * boardScale;
     const messageY = boardBottomY + 30 * boardScale; // Position below the board
@@ -1309,6 +1315,8 @@ function evaluateMove(sourceIndex, destIndex) {
                 score += AI_SCORING_WEIGHTS.CREATE_KILL; // This move creates a kill
                 if (neighborHex.unit === 2) { // It's an archer!
                     score += AI_SCORING_WEIGHTS.KILL_ARCHER_BONUS; // Add a huge bonus for killing a valuable unit
+                } else if (neighborHex.unit === 3) { // It's a cavalry!
+                    score += AI_SCORING_WEIGHTS.KILL_CAVALRY_BONUS;
                 }
             } else if (threats === 2) {
                 score += AI_SCORING_WEIGHTS.SETUP_KILL; // This move sets up a kill
@@ -1345,6 +1353,8 @@ function evaluateMove(sourceIndex, destIndex) {
         for (const playerUnit of playerUnitsInDestZone) {
             if (playerUnit.unit === 2) { // It's an archer!
                 score += AI_SCORING_WEIGHTS.KILL_ARCHER_BONUS;
+            } else if (playerUnit.unit === 3) { // It's a cavalry!
+                score += AI_SCORING_WEIGHTS.KILL_CAVALRY_BONUS;
             }
         }
     }
@@ -2110,16 +2120,21 @@ function handleAITurn() {
         return;
     }
 
-    // If no unit movement animation is playing, find and execute the next best AI move.
+    // If no unit movement animation is playing, decide the next AI action.
     if (gameState.animateMovementTo === null) {
         const bestMove = findBestAIMove();
 
-        if (bestMove) {
-            executeAIMove(bestMove);
-        } else {
-            // No more valid moves, AI's turn is over.
+        // Condition to end the turn: No move is possible, OR it's not the first move and the best move isn't beneficial (score <= 0).
+        const shouldEndTurn = !bestMove || (gameState.aiMovesMadeThisTurn > 0 && bestMove.score <= 0);
+
+        if (shouldEndTurn) {
+            // End the AI's turn.
             gameState.isPlayerTurn = true;
             gameState.secretArcherZone = floor(random(6)) + 1; // New secret zone for player
+        } else {
+            // Execute the move.
+            executeAIMove(bestMove);
+            gameState.aiMovesMadeThisTurn++;
         }
     }
 }
@@ -2531,6 +2546,8 @@ function drawAnimation() {
             for (let zone = 1; zone <= 7; zone++) {
                 checkZoneControl(zone, ENEMY_TEAM);
             }
+            // Save the state after the AI's move and combat resolution are complete
+            saveGameState();
         }
     }
 }
@@ -2822,11 +2839,13 @@ function handleEndTurnButton() {
         // End the turn if at least one move has been made, or if all possible moves have been made.
         if (gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1) {
             gameState.zonesMovedFromThisTurn.clear();
+            gameState.aiMovesMadeThisTurn = 0; // Reset AI move counter
             gameState.aiZonesMovedFromThisTurn.clear(); // Reset AI moves for its turn
             gameState.endTurn = 0;
             gameState.badClick = 0;
             gameState.playerTurnCount++;
             gameState.isPlayerTurn = false; // Switch to AI's turn
+            saveGameState();
         }
         return true; // Fire button was pressed
     }
@@ -2881,6 +2900,7 @@ function mouseClicked() {
     }
 
     handleBoardClick();
+    saveGameState();
 }
 
 /**
@@ -2899,5 +2919,92 @@ function handleDifficultyButtons() {
         return true;
     }
     return false;
+}
+
+/**
+ * Saves the current game state to the browser's localStorage.
+ */
+function saveGameState() {
+    // Don't save during animations or on menu screens
+    if (gameState.currentScreen !== 'game' || zoomOutAnimationState.phase !== 'inactive' || zoomInAnimationState.phase !== 'inactive') {
+        return;
+    }
+    try {
+        const hexState = hexagon.map(h => ({ unit: h.unit, team: h.team }));
+        const stateToSave = {
+            gameState: {
+                ...gameState,
+                // Convert Sets to Arrays for JSON serialization
+                zonesMovedFromThisTurn: Array.from(gameState.zonesMovedFromThisTurn),
+                aiTurnInitialZones: Array.from(gameState.aiTurnInitialZones),
+                aiZonesMovedFromThisTurn: Array.from(gameState.aiZonesMovedFromThisTurn),
+                validMoves: Array.from(gameState.validMoves),
+                // We don't need to save the animation or click states
+                animationLoop: 0,
+                animateMovementFrom: null,
+                animateMovementTo: null,
+                badClick: 0,
+            },
+            hexState: hexState,
+            DIFFICULTY: DIFFICULTY,
+        };
+
+        localStorage.setItem('zoomBftmSaveState', JSON.stringify(stateToSave));
+        // console.log("Game state saved."); // Can be noisy, uncomment for debugging
+    } catch (e) {
+        console.error("Failed to save game state:", e);
+    }
+}
+
+/**
+ * Loads the game state from localStorage if it exists.
+ * @returns {boolean} True if a state was successfully loaded, false otherwise.
+ */
+function loadGameState() {
+    try {
+        const savedStateJSON = localStorage.getItem('zoomBftmSaveState');
+        if (!savedStateJSON) {
+            return false;
+        }
+
+        const savedState = JSON.parse(savedStateJSON);
+
+        // VALIDATION: Check if the saved state is a valid, in-progress game.
+        // A saved game must have a gameState object and be on level 1 or higher.
+        if (!savedState.gameState || !savedState.gameState.level || savedState.gameState.level < 1) {
+            console.warn("Found invalid or old save data. Discarding it.");
+            localStorage.removeItem('zoomBftmSaveState'); // Clean up the bad data
+            return false;
+        }
+
+        // Restore game state
+        gameState = {
+            ...savedState.gameState,
+            // Convert Arrays back to Sets
+            zonesMovedFromThisTurn: new Set(savedState.gameState.zonesMovedFromThisTurn),
+            aiTurnInitialZones: new Set(savedState.gameState.aiTurnInitialZones),
+            aiZonesMovedFromThisTurn: new Set(savedState.gameState.aiZonesMovedFromThisTurn),
+            validMoves: new Set(savedState.gameState.validMoves),
+            // Restore non-serializable parts
+            levelMemory: new Map(), // levelMemory is complex, reset for now
+        };
+
+        // Restore hex board
+        for (let i = 0; i < hexagon.length; i++) {
+            hexagon[i].unit = savedState.hexState[i].unit;
+            hexagon[i].team = savedState.hexState[i].team;
+        }
+
+        // Restore difficulty
+        DIFFICULTY = savedState.DIFFICULTY;
+
+        console.log("Game state loaded successfully.");
+        return true;
+    } catch (e) {
+        console.error("Failed to load game state:", e);
+        // If loading fails, clear the bad data to prevent future errors
+        localStorage.removeItem('zoomBftmSaveState');
+        return false;
+    }
 }
 /*  */
