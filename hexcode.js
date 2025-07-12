@@ -3105,6 +3105,8 @@ function saveGameState() {
                 aiZonesMovedFromThisTurn: Array.from(gameState.aiZonesMovedFromThisTurn),
                 validMoves: Array.from(gameState.validMoves),
                 scoutMessageShownOnLevels: Array.from(gameState.scoutMessageShownOnLevels),
+                // Convert the levelMemory Map to a serializable array of [key, value] pairs.
+                levelMemory: Array.from(gameState.levelMemory.entries()),
                 // We don't need to save the animation or click states
                 animationLoop: 0,
                 animateMovementFrom: null,
@@ -3154,8 +3156,8 @@ function loadGameState() {
             validMoves: new Set(savedState.gameState.validMoves),
             // Gracefully handle old save files that don't have the scout message history
             scoutMessageShownOnLevels: new Set(savedState.gameState.scoutMessageShownOnLevels || []),
-            // Restore non-serializable parts
-            levelMemory: new Map(), // levelMemory is complex, reset for now
+            // Restore the levelMemory Map from its serialized array format.
+            levelMemory: new Map(savedState.gameState.levelMemory || []),
         };
 
         // Restore hex board
