@@ -64,16 +64,15 @@ const UI_DOT_LAYOUT = [
 let sounds = {}; // Object to hold our loaded sound files
 let uiLayout = {}; // Object to hold pre-calculated UI layout values
 let hexesByZone = new Map(); // Cache for quick lookups of hexes by zone
+let hexRangeCache = new Map(); // Cache for pre-calculated hex ranges to improve performance
 let hexagon = [];
 let gameState = {
-    selected: -1, // -1 means not selected, 0-48 is selected hex number
-    win: 0,
+    selected: -1, // -1 means not selected, 0-48 is selected hex number    
     badClick: 0,
     zonesMovedFromThisTurn: new Set(),
     endTurn: 0,
     isPlayerTurn: true,
-    aiMoveQueue: [],
-    aiTurnInitialZones: new Set(), // AI's potential moves for the turn
+    aiMoveQueue: [],    
     aiZonesMovedFromThisTurn: new Set(), // AI's used moves for the turn
     aiMovesMadeThisTurn: 0, // Number of moves AI has made in its current turn
     introScreenDifficulty: 0, // Difficulty setting for the intro screen
@@ -89,6 +88,7 @@ let gameState = {
     hasBeenOnLevel3: false, // Tracks if the player has ever been on level 3, for the archer intro
     hasBeenOnLevel2: false, // Tracks if the player has ever been on level 2, for the cavalry intro
     playerTurnCount: 0, // How many turns the player has taken on this level
+    scoutMessageShownOnLevels: new Set(), // Tracks levels where the scout message has been shown.
     secretArcherZone: null, // The zone hinted at in the scout message
     selectedZone: null, // The currently selected zone number (1-7)
     zoneSelectionMode: false, // Is the player currently in the mode to select a zone?
@@ -156,27 +156,7 @@ class Hexagon {
         vertex(pos.x - r * sqrt(3) / 2, pos.y - r / 2);
         endShape(CLOSE);
     }
-
-    showCoordinates(index) {
-        fill(32, 4, 133);
-        textSize(12);
-        text(this.xHex + ", ",
-            hexToXY(this.xHex, this.yHex).x - 19,
-            hexToXY(this.xHex, this.yHex).y); //x coordinate
-        text(this.yHex,
-            hexToXY(this.xHex, this.yHex).x - 19,
-            hexToXY(this.xHex, this.yHex).y + 11); //y coordinate
-        text(index,
-            hexToXY(this.xHex, this.yHex).x - 16,
-            hexToXY(this.xHex, this.yHex).y - 11); //displays hex number
-    }
 }
-
-//evaluates whether hexes are adjacent based on *Hex Coordinates*.  Boolean
-function adjacent(xHex1, yHex1, xHex2, yHex2)     {
-    return ((xHex1 === xHex2 + 1 && (yHex1 === yHex2 + 1 || yHex1 === yHex2)) ||
-            (xHex1 === xHex2 && (yHex1 === yHex2 + 1 || yHex1 === yHex2 - 1)) ||                        (xHex1 === xHex2 - 1 && (yHex1 === yHex2 || yHex1 === yHex2 - 1)));
-};
 
 //converts x, y-ish hex coordinates to actual x, y position
 function hexToXY(xHexA, yHexA)   {
@@ -316,7 +296,51 @@ let downArrowButton; // Button for decreasing difficulty
 let skipTo16Button; // DEBUG: Button to skip to level 16
 let iWinButton; // DEBUG: Button to trigger win screen
 
+/**
+ * Pre-calculates and caches the hexes within a certain range for every hex on the board.
+ * This is a one-time operation at startup to significantly speed up functions
+ * like isSurrounded and the AI's move evaluation, which repeatedly need this data.
+ */
+function precalculateHexRanges() {
+    const maxRange = 2; // The maximum range our game logic currently needs.
+    for (let i = 0; i < hexagon.length; i++) {
+        const rangesForHex = new Map();
+        for (let r = 1; r <= maxRange; r++) {
+            // This uses the original BFS logic to calculate the result once.
+            const visited = new Set();
+            const queue = [{ index: i, dist: 0 }];
+            const hexesInRange = new Set();
+            visited.add(i);
+            while (queue.length > 0) {
+                const { index, dist } = queue.shift();
+                if (dist > 0 && dist <= r) {
+                    hexesInRange.add(index);
+                }
+                if (dist < r) {
+                    for (const adjIndex of hexagon[index].adjacencies) {
+                        if (!visited.has(adjIndex)) {
+                            visited.add(adjIndex);
+                            queue.push({ index: adjIndex, dist: dist + 1 });
+                        }
+                    }
+                }
+            }
+            rangesForHex.set(r, Array.from(hexesInRange));
+        }
+        hexRangeCache.set(i, rangesForHex);
+    }
+    console.log("Hex ranges pre-calculated and cached.");
+}
+
 function getHexesInRange(startIndex, range) {
+    // First, try to retrieve the pre-calculated result from the cache.
+    if (hexRangeCache.has(startIndex) && hexRangeCache.get(startIndex).has(range)) {
+        return hexRangeCache.get(startIndex).get(range);
+    }
+
+    // Fallback to on-the-fly calculation if the result wasn't cached.
+    // This is a safety net and shouldn't be hit for ranges 1 and 2 after setup.
+    console.warn(`Cache miss for getHexesInRange(startIndex: ${startIndex}, range: ${range}). Calculating on the fly.`);
     const visited = new Set();
     const queue = [{ index: startIndex, dist: 0 }];
     const hexesInRange = new Set();
@@ -657,32 +681,58 @@ function showStatusMessage() {
 }
 
 /**
- * Draws a message at the bottom of the screen hinting at a bonus for zooming in.
- * The message is only shown on the first few turns of a level.
+ * @private
+ * Determines the state of the scout message. This is the single source of truth
+ * for both drawing the message and checking if the bonus is active.
+ * @returns {{show: boolean, lost: boolean}} An object indicating if the message should be shown, and if the opportunity is lost.
  */
-function drawScoutMessage() {
+function _getScoutMessageState() {
+    // Condition 1: The feature is only available on level 4+
+    if (gameState.level < 4) {
+        return { show: false, lost: false };
+    }
+
+    // Condition 2: The feature has already been used or expired on this level.
+    if (gameState.scoutMessageShownOnLevels.has(gameState.level)) {
+        return { show: false, lost: true };
+    }
+
+    // Condition 3: It must be the player's turn and a secret zone must be set.
+    if (!gameState.isPlayerTurn || !gameState.secretArcherZone) {
+        return { show: false, lost: false };
+    }
+
+    // Condition 4: Check turn count and moves made.
     const movesMade = gameState.zonesMovedFromThisTurn.size;
     const turnCount = gameState.playerTurnCount;
     const moveThreshold = 5 - turnCount;
 
-    let showFoundMessage = false;
-    let showLostMessage = false;
-
-    // Determine if the message should be shown based on the turn and moves made.
     if (turnCount >= 1 && turnCount <= 4) {
         if (movesMade < moveThreshold) {
-            showFoundMessage = true;
-        } else if (movesMade === moveThreshold) {
-            showLostMessage = true;
+            // The opportunity is available.
+            return { show: true, lost: false };
+        } else {
+            // The opportunity is lost for this turn, but we still show the "lost" message.
+            return { show: true, lost: true };
         }
     }
 
-    // Only draw if conditions are met and it's the player's turn.
-    if ((!showFoundMessage && !showLostMessage) || !gameState.isPlayerTurn || !gameState.secretArcherZone || gameState.level < 4) {
+    // If none of the above conditions for showing the message are met.
+    return { show: false, lost: false };
+}
+
+/**
+ * Draws a message at the bottom of the screen hinting at a bonus for zooming in.
+ * The message is only shown on the first few turns of a level.
+ */
+function drawScoutMessage() {
+    const { show, lost } = _getScoutMessageState();
+
+    if (!show) {
         return;
     }
 
-    const message = showFoundMessage
+    const message = !lost
         ? `Your scouts have encountered an archer sympathetic to your cause in the countryside beyond Zone ${gameState.secretArcherZone}.`
         : "Unfortunately, your scouts have lost track of the friendly archer.  Perhaps he will turn up again later.";
     // Position the message vertically below the board.
@@ -690,11 +740,10 @@ function drawScoutMessage() {
     const messageY = boardBottomY + 30 * boardScale; // Position below the board
 
     fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale); // Make text smaller to fit
+    textSize(14 * boardScale);
     textAlign(CENTER, CENTER);
 
-    // To center a text box, its x-coordinate must be offset by half its width.
-    const boxWidth = width * 0.5; // Make it narrower to avoid UI collision
+    const boxWidth = width * 0.5;
     const boxX = -boxWidth / 2;
 
     text(message, boxX, messageY, boxWidth);
@@ -705,12 +754,12 @@ function drawScoutMessage() {
  * This message is only shown on level 2.
  */
 function drawCavalryMessage() {
-    // Only show this message on level 2 during the player's turn, and only the first time they reach it.
-    if (gameState.level !== 2 || !gameState.isPlayerTurn || gameState.hasBeenOnLevel2) {
+    // Only show this message on level 2, and only the first time the player reaches it.
+    if (gameState.level !== 2 || gameState.hasBeenOnLevel2) {
         return;
     }
 
-    const message = `Cavalry fight like soldiers, but can travel 2 hexes per move. Control a zone with a 4-unit advantage to get a cavalry on the next level.`;
+    const message = `Cavalry fight like soldiers, but can travel 2 hexes per move. Control a zone with a 3-unit advantage to get a cavalry on the next level.`;
 
     // Position the message vertically below the board.
     const boardBottomY = 200 * boardScale;
@@ -731,8 +780,8 @@ function drawCavalryMessage() {
  * This message is only shown on level 3.
  */
 function drawArcherMessage() {
-    // Only show this message on level 3 during the player's turn, and only the first time they reach it.
-    if (gameState.level !== 3 || !gameState.isPlayerTurn || gameState.hasBeenOnLevel3) {
+    // Only show this message on level 3, and only the first time the player reaches it.
+    if (gameState.level !== 3 || gameState.hasBeenOnLevel3) {
         return;
     }
 
@@ -753,31 +802,46 @@ function drawArcherMessage() {
 }
 
 /**
+ * Draws a message at the bottom of the screen informing the player which zone on the higher level
+ * they are currently fighting for. This is only shown after a zoom-in.
+ */
+function drawZoomOutTargetMessage() {
+    const higherLevel = gameState.level + 1;
+    // Check if we are in a "zoomed-in" state by seeing if a higher level's state is stored.
+    if (!gameState.levelMemory.has(higherLevel)) {
+        return;
+    }
+
+    const savedData = gameState.levelMemory.get(higherLevel);
+    const targetZone = savedData.excludedZone;
+    const targetLevelName = LEVEL_NAMES[higherLevel - 1] || `Level ${higherLevel}`;
+
+    const message = `You are fighting for Zone ${targetZone} on ${targetLevelName}.`;
+
+    // Use the same positioning and style as the other bottom-screen messages.
+    const boardBottomY = 200 * boardScale;
+    const messageY = boardBottomY + 30 * boardScale; // Position below the board
+
+    fill(50, 50, 150); // A dark, strategic blue
+    textSize(14 * boardScale);
+    textAlign(CENTER, CENTER);
+
+    const boxWidth = width * 0.5;
+    const boxX = -boxWidth / 2;
+
+    text(message, boxX, messageY, boxWidth);
+}
+
+/**
  * Checks if the scout message is currently being displayed. This is the condition
  * for the player to receive a bonus archer when zooming out.
  * @returns {boolean} True if the message is active, false otherwise.
  */
 function isScoutMessageActive() {
-    // The message is only active during the player's turn and when a secret zone has been assigned.
-    if (!gameState.isPlayerTurn || !gameState.secretArcherZone || gameState.level < 4) {
-        return false;
-    }
-
-    let showMessage = false;
-    const movesMade = gameState.zonesMovedFromThisTurn.size;
-
-    // This logic mirrors the conditions in drawScoutMessage()
-    if (gameState.playerTurnCount === 1 && movesMade < 4) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 2 && movesMade < 3) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 3 && movesMade < 2) {
-        showMessage = true;
-    } else if (gameState.playerTurnCount === 4 && movesMade < 1) {
-        showMessage = true;
-    }
-
-    return showMessage;
+    // This function now uses the single source of truth to determine if the bonus is active.
+    // The bonus is active if the message is being shown AND the opportunity has not been lost.
+    const { show, lost } = _getScoutMessageState();
+    return show && !lost;
 }
 
 function drawMiniHexagon(x, y, r) {
@@ -991,7 +1055,7 @@ function calculateZoneDominance() { // Simplified archer logic
             // New rules for player carryover based on advantage and presence
             if ((playerAdvantage >= 6 || playerHasArcher) && (gameState.level + 1 >= 3)) {
                 zoneDominance[zone].unitType = 2; // Archer for 6+ advantage or presence
-            } else if ((playerAdvantage >= 4 || playerHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
+            } else if ((playerAdvantage >= 3 || playerHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
                 zoneDominance[zone].unitType = 3; // Cavalry for 4-5 advantage or presence
             }
         } else {
@@ -1004,7 +1068,7 @@ function calculateZoneDominance() { // Simplified archer logic
                 // AI carryover rules
                 if ((enemyAdvantage >= 6 || enemyHasArcher) && (gameState.level + 1 >= 3)) {
                     zoneDominance[zone].unitType = 2; // Archer for 6+ advantage or presence
-                } else if ((enemyAdvantage >= 4 || enemyHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
+                } else if ((enemyAdvantage >= 3 || enemyHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
                     zoneDominance[zone].unitType = 3; // Cavalry for 4-5 advantage or presence
                 }
             }
@@ -1068,22 +1132,41 @@ function generateZoomInBoard(sourceZone) {
         boardState[i] = { unit: 0, team: 0 };
     }
 
-    // Define the weighted probability tables for unit distribution.
-    const playerControlledOptions = [
-        { value: [3, 2], weight: 4 }, // 5 units, player advantage
-        { value: [2, 1], weight: 2 }, // 3 units, player advantage
-        { value: [4, 2], weight: 2 }, // 6 units, player advantage
-        { value: [1, 0], weight: 1 }  // 1 unit, player advantage
+    // --- Define weighted probability tables for unit distribution ---
+    // These tables reflect the "power level" of the source hex, while also
+    // maintaining the principle that zoom-ins are slightly more difficult.
+
+    // For Soldier hexes (reflects a +2 advantage, penalized to ~+1)
+    const playerSoldierOptions = [
+        { value: [3, 2], weight: 4 }, { value: [2, 1], weight: 3 },
+        { value: [4, 2], weight: 2 }, { value: [1, 0], weight: 1 }
+    ];
+    const enemySoldierOptions = [
+        { value: [2, 3], weight: 4 }, { value: [1, 2], weight: 3 },
+        { value: [2, 4], weight: 2 }, { value: [0, 1], weight: 1 }
     ];
 
-    const enemyControlledOptions = [
-        { value: [1, 4], weight: 4 }, // 5 units, enemy advantage
-        { value: [0, 4], weight: 3 }, // 4 units, enemy advantage
-        { value: [1, 5], weight: 2 }, // 6 units, enemy advantage
-        { value: [0, 5], weight: 2 }, // 5 units, enemy advantage
-        { value: [0, 3], weight: 1 }  // 3 units, enemy advantage
+    // For Cavalry hexes (reflects a +3 advantage, penalized to ~+2)
+    const playerCavalryOptions = [
+        { value: [4, 2], weight: 4 }, { value: [3, 1], weight: 3 },
+        { value: [5, 2], weight: 2 }, { value: [2, 0], weight: 1 }
+    ];
+    const enemyCavalryOptions = [
+        { value: [2, 4], weight: 4 }, { value: [1, 3], weight: 3 },
+        { value: [2, 5], weight: 2 }, { value: [0, 2], weight: 1 }
     ];
 
+    // For Archer hexes (reflects a +6 advantage, penalized to ~+4/5)
+    const playerArcherOptions = [
+        { value: [5, 1], weight: 4 }, { value: [6, 1], weight: 3 },
+        { value: [4, 0], weight: 2 }, { value: [6, 0], weight: 1 }
+    ];
+    const enemyArcherOptions = [
+        { value: [1, 5], weight: 4 }, { value: [1, 6], weight: 3 },
+        { value: [0, 4], weight: 2 }, { value: [0, 6], weight: 1 }
+    ];
+
+    // For Neutral hexes (slight enemy advantage, as per original design)
     const neutralOptions = [
         { value: [2, 3], weight: 4 }, // 5 units, enemy advantage
         { value: [1, 2], weight: 2 }, // 3 units, enemy advantage
@@ -1129,15 +1212,48 @@ function generateZoomInBoard(sourceZone) {
     for (const [sourceHex, newZoneNum] of sourceHexToNewZoneMap.entries()) {
         const hexesInNewZone = hexagon.map((h, i) => ({...h, index: i})).filter(h => h.zone === newZoneNum).map(h => h.index);
 
-        let unitCounts, playerUnits, enemyUnits, hasArcher = false, archerTeam = 0;
+        let unitCounts, playerUnits, enemyUnits;
+        let hasArcher = false, hasCavalry = false, specialUnitTeam = 0;
 
         if (sourceHex.team === PLAYER_TEAM) {
-            unitCounts = getWeightedRandom(playerControlledOptions);
-            if (sourceHex.unit === 2) { hasArcher = true; archerTeam = PLAYER_TEAM; }
+            specialUnitTeam = PLAYER_TEAM;
+            if (sourceHex.unit === 2) { // Player Archer
+                if (random() < 0.5) { // 50% chance for direct carryover
+                    unitCounts = getWeightedRandom(playerSoldierOptions);
+                    hasArcher = true;
+                } else { // 50% chance for soldier advantage
+                    unitCounts = getWeightedRandom(playerArcherOptions);
+                }
+            } else if (sourceHex.unit === 3) { // Player Cavalry
+                if (random() < 0.5) { // 50% chance for direct carryover
+                    unitCounts = getWeightedRandom(playerSoldierOptions);
+                    hasCavalry = true;
+                } else { // 50% chance for soldier advantage
+                    unitCounts = getWeightedRandom(playerCavalryOptions);
+                }
+            } else { // Soldier
+                unitCounts = getWeightedRandom(playerSoldierOptions);
+            }
         } else if (sourceHex.team === ENEMY_TEAM) {
-            unitCounts = getWeightedRandom(enemyControlledOptions);
-            if (sourceHex.unit === 2) { hasArcher = true; archerTeam = ENEMY_TEAM; }
-        } else {
+            specialUnitTeam = ENEMY_TEAM;
+            if (sourceHex.unit === 2) { // Enemy Archer
+                if (random() < 0.5) { // 50% chance for direct carryover
+                    unitCounts = getWeightedRandom(enemySoldierOptions);
+                    hasArcher = true;
+                } else { // 50% chance for soldier advantage
+                    unitCounts = getWeightedRandom(enemyArcherOptions);
+                }
+            } else if (sourceHex.unit === 3) { // Enemy Cavalry
+                if (random() < 0.5) { // 50% chance for direct carryover
+                    unitCounts = getWeightedRandom(enemySoldierOptions);
+                    hasCavalry = true;
+                } else { // 50% chance for soldier advantage
+                    unitCounts = getWeightedRandom(enemyCavalryOptions);
+                }
+            } else { // Soldier
+                unitCounts = getWeightedRandom(enemySoldierOptions);
+            }
+        } else { // Neutral
             unitCounts = getWeightedRandom(neutralOptions);
         }
 
@@ -1155,14 +1271,26 @@ function generateZoomInBoard(sourceZone) {
             boardState[hexesInNewZone[i]] = unitPool[i];
         }
 
-        // Only place an archer if the destination level is 3 or higher.
+        // If the source hex had an archer, convert one of the new soldiers.
         if (hasArcher && (gameState.level - 1 >= 3)) {
             const potentialArcherHexes = hexesInNewZone.filter(i =>
-                boardState[i].team === archerTeam && boardState[i].unit === 1
+                boardState[i].team === specialUnitTeam && boardState[i].unit === 1
             );
             if (potentialArcherHexes.length > 0) {
                 const hexToConvert = random(potentialArcherHexes);
                 boardState[hexToConvert].unit = 2;
+            }
+        }
+
+        // If the source hex had a cavalry, convert one of the new soldiers.
+        if (hasCavalry && (gameState.level - 1 >= 2)) {
+            const potentialCavalryHexes = hexesInNewZone.filter(i =>
+                boardState[i].team === specialUnitTeam && boardState[i].unit === 1
+            );
+            if (potentialCavalryHexes.length > 0) {
+                // Avoid converting the same hex if it was already converted to an archer (unlikely but possible)
+                const hexToConvert = random(potentialCavalryHexes.filter(i => boardState[i].unit === 1));
+                if (hexToConvert) boardState[hexToConvert].unit = 3;
             }
         }
     }
@@ -1272,7 +1400,7 @@ function startNewLevel() {
     }
 
     // 4. Reset game state for the new level
-    gameState = { ...gameState, selected: -1, win: 0, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiTurnInitialZones: new Set(), aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: gameState.level + 1, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1 };
+    gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: gameState.level + 1, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1 };
     if (gameState.level >= 3) { // Introduce AI archers from level 3
         _convertRandomSoldier(hexagon, ENEMY_TEAM, 2, 'archer');
     }
@@ -1325,13 +1453,27 @@ function evaluateMove(sourceIndex, destIndex) {
     }
 
     // --- 2. Defensive Score: Avoid moving into danger ---
-    let adjacentPlayerUnits = 0;
-    for (const neighborIndex of hexagon[destIndex].adjacencies) {
-        if (hexagon[neighborIndex].team === PLAYER_TEAM) {
-            adjacentPlayerUnits++;
+    // The AI needs to understand all threats to a destination hex, including ranged attacks.
+    let playerThreats = 0;
+    const directNeighborSet = new Set(hexagon[destIndex].adjacencies);
+    // We only need to check up to range 2 for archer threats.
+    const nearbyHexIndices = getHexesInRange(destIndex, 2);
+
+    for (const hexIndex of nearbyHexIndices) {
+        const potentialAttacker = hexagon[hexIndex];
+        // Check if there's a player unit on this hex
+        if (potentialAttacker.team === PLAYER_TEAM && potentialAttacker.unit !== 0) {
+            if (directNeighborSet.has(hexIndex)) {
+                // It's an adjacent threat (any player unit type).
+                playerThreats++;
+            } else if (potentialAttacker.unit === 2) {
+                // It's a non-adjacent ranged threat (must be a player archer).
+                playerThreats++;
+            }
         }
     }
-    if (adjacentPlayerUnits >= 2) {
+    // A move is dangerous if it moves into a position threatened by 2 or more player units.
+    if (playerThreats >= 2) {
         score += AI_SCORING_WEIGHTS.DANGEROUS_MOVE; // This move is dangerous (value is negative)
     }
 
@@ -1639,6 +1781,9 @@ function startLevelTransition(bonusArcher = false) {
         if (gameState.level === 3) {
             gameState.hasBeenOnLevel3 = true;
         }
+        // Mark the current level as having had its scout feature opportunity.
+        gameState.scoutMessageShownOnLevels.add(gameState.level);
+
         const nextLevel = gameState.level + 1; // The level we are transitioning TO.
         DIFFICULTY++;
         zoomOutAnimationState.phase = 'shrinking';
@@ -1657,6 +1802,9 @@ function startLevelTransition(bonusArcher = false) {
         zoomOutAnimationState.targetZoneForReveal = targetZone;
         zoomOutAnimationState.targetZoneCenterPos = centerPos;
         zoomOutAnimationState.revealMap = revealMap;
+
+        // Save the state immediately after configuring the animation.
+        saveGameState();
     }
 }
 
@@ -1755,6 +1903,7 @@ function setup() {
     for (let i = 0; i < hexagon.length; i++) {
         hexesByZone.get(hexagon[i].zone).push(hexagon[i]);
     }
+    precalculateHexRanges(); // One-time calculation for performance
 
     // Initialize colors (must be done in setup or draw in p5.js)
     zoneColor = [
@@ -2057,7 +2206,7 @@ function updateZoomOutAnimationState() {
             if (zoomOutAnimationState.revealTimer <= 0) {
                 // Final pause is over. Reset for the next level.
                 const nextLevel = gameState.level + 1;
-                gameState = { ...gameState, selected: -1, win: 0, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiTurnInitialZones: new Set(), aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1 };
+                gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1 };
                 gameState.introScreenDifficulty = DIFFICULTY; // Sync intro screen difficulty with current game difficulty
                 zoomOutAnimationState.phase = 'inactive';
             }
@@ -2098,12 +2247,16 @@ function drawGameUI() {
     if (gameState.isPlayerTurn) {
         fire.draw(gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1); // Pass active state
         skipTo16Button.draw(true); // DEBUG
-        iWinButton.draw(true); // DEBUG
-        drawCavalryMessage();
-        drawArcherMessage();
+        // iWinButton.draw(true); // DEBUG
         drawScoutMessage();
         showStatusMessage();
     }
+
+    // These messages are informational and should be visible on both turns.
+    drawCavalryMessage();
+    drawArcherMessage();
+    drawZoomOutTargetMessage();
+
     // Draw the "Moves Left" UI for both player and AI
     drawAvailableMovesUI();
     pop();
@@ -2360,6 +2513,9 @@ function drawZoomInAnimation() {
                 gameState.hasBeenOnLevel2 = true;
             }
 
+            // Mark the higher level as having had its scout feature opportunity before descending.
+            gameState.scoutMessageShownOnLevels.add(gameState.level);
+
             // 1. Save the current (higher) level's state BEFORE descending.
             saveOuterZoneState(gameState.level, zoomInAnimationState.sourceZone);
 
@@ -2371,7 +2527,7 @@ function drawZoomInAnimation() {
 
             // 3. Reset game state for the new, lower level.
             const nextLevel = gameState.level - 1;
-            gameState = { ...gameState, selected: -1, win: 0, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiTurnInitialZones: new Set(), aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null };
+            gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null };
             zoomInAnimationState.phase = 'inactive'; // Reset the animation state machine
         }
     }
@@ -2730,17 +2886,17 @@ function handleDebugButtons() {
     // For now, we'll just check if the buttons exist.
     if (!iWinButton || !skipTo16Button) return false;
 
-    if (iWinButton.pressed() && gameState.isPlayerTurn) {
-        gameState.level = LEVEL_NAMES.length; // Set to final level
-        // Remove all enemy units to trigger win condition
-        for (const hex of hexagon) {
-            if (hex.team === ENEMY_TEAM) {
-                hex.unit = 0;
-                hex.team = 0;
-            }
-        }
-        return true;
-    }
+    // if (iWinButton.pressed() && gameState.isPlayerTurn) {
+    //     gameState.level = LEVEL_NAMES.length; // Set to final level
+    //     // Remove all enemy units to trigger win condition
+    //     for (const hex of hexagon) {
+    //         if (hex.team === ENEMY_TEAM) {
+    //             hex.unit = 0;
+    //             hex.team = 0;
+    //         }
+    //     }
+    //     return true;
+    // }
 
     if (skipTo16Button.pressed() && gameState.isPlayerTurn) {
         // --- Skip directly to level 16 without animation ---
@@ -2766,7 +2922,7 @@ function handleDebugButtons() {
             hexagon[i].unit = newBoard[i].unit;
             hexagon[i].team = newBoard[i].team;
         }
-        gameState = { ...gameState, selected: -1, win: 0, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiTurnInitialZones: new Set(), aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 16, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null };
+        gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 16, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null };
         if (sounds.boom2) sounds.boom2.play();
         return true;
     }
@@ -2815,6 +2971,9 @@ function handleZoomButtons() {
             zoomInAnimationState.precalculatedBoard = generateZoomInBoard(gameState.selectedZone);
 
             if (sounds.boom1) sounds.boom1.play();
+
+            // Save the state immediately after configuring the animation.
+            saveGameState();
 
             gameState.zoneSelectionMode = false;
             gameState.selectedZone = null;
@@ -2925,20 +3084,27 @@ function handleDifficultyButtons() {
  * Saves the current game state to the browser's localStorage.
  */
 function saveGameState() {
-    // Don't save during animations or on menu screens
-    if (gameState.currentScreen !== 'game' || zoomOutAnimationState.phase !== 'inactive' || zoomInAnimationState.phase !== 'inactive') {
+    // Do not save if we are not on the game screen.
+    if (gameState.currentScreen !== 'game') {
         return;
     }
     try {
         const hexState = hexagon.map(h => ({ unit: h.unit, team: h.team }));
+
+        // Prepare animation states for serialization
+        const serializableZoomOutState = {
+            ...zoomOutAnimationState,
+            revealMap: Array.from(zoomOutAnimationState.revealMap.entries()) // Convert Map to Array
+        };
+
         const stateToSave = {
             gameState: {
                 ...gameState,
                 // Convert Sets to Arrays for JSON serialization
-                zonesMovedFromThisTurn: Array.from(gameState.zonesMovedFromThisTurn),
-                aiTurnInitialZones: Array.from(gameState.aiTurnInitialZones),
+                zonesMovedFromThisTurn: Array.from(gameState.zonesMovedFromThisTurn),                
                 aiZonesMovedFromThisTurn: Array.from(gameState.aiZonesMovedFromThisTurn),
                 validMoves: Array.from(gameState.validMoves),
+                scoutMessageShownOnLevels: Array.from(gameState.scoutMessageShownOnLevels),
                 // We don't need to save the animation or click states
                 animationLoop: 0,
                 animateMovementFrom: null,
@@ -2947,6 +3113,8 @@ function saveGameState() {
             },
             hexState: hexState,
             DIFFICULTY: DIFFICULTY,
+            zoomOutAnimationState: serializableZoomOutState,
+            zoomInAnimationState: zoomInAnimationState // This one is already serializable
         };
 
         localStorage.setItem('zoomBftmSaveState', JSON.stringify(stateToSave));
@@ -2982,9 +3150,10 @@ function loadGameState() {
             ...savedState.gameState,
             // Convert Arrays back to Sets
             zonesMovedFromThisTurn: new Set(savedState.gameState.zonesMovedFromThisTurn),
-            aiTurnInitialZones: new Set(savedState.gameState.aiTurnInitialZones),
-            aiZonesMovedFromThisTurn: new Set(savedState.gameState.aiZonesMovedFromThisTurn),
+            aiZonesMovedFromThisTurn: new Set(savedState.gameState.aiZonesMovedFromThisTurn),            
             validMoves: new Set(savedState.gameState.validMoves),
+            // Gracefully handle old save files that don't have the scout message history
+            scoutMessageShownOnLevels: new Set(savedState.gameState.scoutMessageShownOnLevels || []),
             // Restore non-serializable parts
             levelMemory: new Map(), // levelMemory is complex, reset for now
         };
@@ -2993,6 +3162,17 @@ function loadGameState() {
         for (let i = 0; i < hexagon.length; i++) {
             hexagon[i].unit = savedState.hexState[i].unit;
             hexagon[i].team = savedState.hexState[i].team;
+        }
+
+        // Restore animation states, if they exist in the save file
+        if (savedState.zoomOutAnimationState) {
+            zoomOutAnimationState = {
+                ...savedState.zoomOutAnimationState,
+                revealMap: new Map(savedState.zoomOutAnimationState.revealMap) // Convert Array back to Map
+            };
+        }
+        if (savedState.zoomInAnimationState) {
+            zoomInAnimationState = savedState.zoomInAnimationState;
         }
 
         // Restore difficulty
