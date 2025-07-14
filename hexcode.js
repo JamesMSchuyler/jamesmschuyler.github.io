@@ -1,4 +1,5 @@
 //Player is black.  
+
 //Eliminate enemies by surrounding on three sides.
 const PLAYER_TEAM = 1;
 const ENEMY_TEAM = 2;
@@ -49,6 +50,19 @@ const AI_SCORING_WEIGHTS = {
     VULNERABLE_ZONE: -150
 };
 
+/**
+ * Defines the rules for promoting a standard soldier to a special unit type
+ * when a zone is captured at the end of a level. The rules are ordered by priority,
+ * with the strongest or most specific units appearing first.
+ */
+const SPECIAL_UNIT_PROMOTION_RULES = [
+    // Rules should be ordered by priority (strongest unit first)
+    { unitType: 2, advantage: 6, minLevel: 3 }, // Archer
+    { unitType: 4, advantage: 4, minLevel: 5 }, // Cannon
+    // Cavalry has a special check: it can be created on level 2, OR any level if the player has been to level 2 before.
+    { unitType: 3, advantage: 3, minLevel: 2, specialLevelCheck: () => gameState.hasBeenOnLevel2 } // Cavalry
+];
+
 // Layout for the 7 dots in a hexagonal cluster for the "Moves Left" UI.
 // Defined globally with normalized coordinates (0 to 1) as it's a constant
 // and doesn't need to be recreated every frame.
@@ -66,6 +80,7 @@ let sounds = {}; // Object to hold our loaded sound files
 let uiLayout = {}; // Object to hold pre-calculated UI layout values
 let hexesByZone = new Map(); // Cache for quick lookups of hexes by zone
 let hexRangeCache = new Map(); // Cache for pre-calculated hex ranges to improve performance
+let hexCoordMap = new Map(); // Cache for mapping "x,y" coordinates to a hex index
 let hexagon = [];
 let gameState = {
     selected: -1, // -1 means not selected, 0-48 is selected hex number    
@@ -94,7 +109,11 @@ let gameState = {
     secretArcherZone: null, // The zone hinted at in the scout message
     potentialCannonTargets: [], // Array of hex indices in the cannon's firing ring
     highlightedCannonTargetGroup: null, // The currently hovered target group
-    cannonThreats: new Map(), // Maps cannon index -> array of 3 threatened hex indices
+    lastAimingHexIndex: null, // The aiming hex used for the last highlighted group
+    cannonIsAiming: false, // True when the cannon has a "locked" target preview
+    lockedAimingHexIndex: null, // The aiming hex index used to create the locked-in target
+    animateCannonThreat: null, // Stores data for the AI cannon targeting animation
+    cannonThreats: new Map(), // Maps cannon index -> { threatenedHexes, relativeAim }
     cannonsFiredThisTurn: new Set(), // Tracks which cannons have fired this turn
     selectedZone: null, // The currently selected zone number (1-7)
     zoneSelectionMode: false, // Is the player currently in the mode to select a zone?
@@ -111,68 +130,6 @@ const ZONE_TO_ZONE_7_HEX_MAP = {
     7: 24  // Zone 7 -> Hex 24
 };
 const ZONE_7_HEX_INDICES = Object.values(ZONE_TO_ZONE_7_HEX_MAP);
-
-class Hexagon {
-    constructor(xHex, yHex, zone, adjacencies, mapsToNewZone = null) {
-        this.xHex = xHex;
-        this.yHex = yHex;
-        this.zone = zone;
-        this.adjacencies = adjacencies;
-        this.mapsToNewZone = mapsToNewZone; // The new zone this hex becomes when its zone is zoomed into
-        this.unit = 0;
-        this.team = 0;
-    }
-
-    draw(index, overrideColor = null) {
-        // 1. Determine fill and stroke colors based on game state.
-        let fillColor = overrideColor || zoneColor[this.zone];
-        let strokeColor = color(0); // Default black
-        let sw = r / 18; // Default stroke weight
-
-        // Highlight for selected zone (lower priority)
-        if (zoomInAnimationState.phase === 'inactive' && gameState.selectedZone === this.zone) {
-            strokeColor = color(255, 255, 0); // Yellow outline for selected zone
-            sw = 3;
-            // Darken the fill color to "shade" the selected zone.
-            fillColor = lerpColor(fillColor, color(0), 0.3);
-        }
-
-        if (zoomOutAnimationState.phase === 'inactive' && gameState.selected !== -1 && gameState.validMoves.has(index)) {
-            strokeColor = color(0, 106, 255); // Lighter blue for valid move
-            sw = 4;
-            fillColor = color(129, 133, 129); // Greenish fill for valid move
-        } else if (zoomOutAnimationState.phase === 'inactive' && gameState.selected === index) {
-            strokeColor = color(4, 0, 255); // Blue outline for selected
-            sw = 4;
-            fillColor = color(105, 101, 101); // Grey fill for selected
-        }
-
-        // 2. Apply styles and draw the hexagon shape.
-        stroke(strokeColor);
-        strokeWeight(sw);
-        fill(fillColor);
-
-        const pos = hexToXY(this.xHex, this.yHex);
-        beginShape();
-        vertex(pos.x, pos.y - r);
-        vertex(pos.x + r * sqrt(3) / 2, pos.y - r / 2);
-        vertex(pos.x + r * sqrt(3) / 2, pos.y + r / 2);
-        vertex(pos.x, pos.y + r);
-        vertex(pos.x - r * sqrt(3) / 2, pos.y + r / 2);
-        vertex(pos.x - r * sqrt(3) / 2, pos.y - r / 2);
-        endShape(CLOSE);
-    }
-
-    showCoordinates(index) {
-        const pos = hexToXY(this.xHex, this.yHex);
-        fill(0);
-        noStroke();
-        textAlign(CENTER, CENTER);
-        textSize(12);
-        text(index, pos.x, pos.y);
-        textAlign(LEFT, BASELINE); // Reset alignment
-    }
-}
 
 //converts x, y-ish hex coordinates to actual x, y position
 function hexToXY(xHexA, yHexA)   {
@@ -303,14 +260,13 @@ class Button {
     }
 }
 
-let fire; // Will be initialized in setup()
+let endTurnButton; // Will be initialized in setup()
 let zoomOutButton; // New button for testing win screen
-let continueButton; // Button on the intro screen
+let newGameButton; // Button on the intro screen
 let startButton; // Button on the instructions screen
-let upArrowButton; // Button for increasing difficulty
-let downArrowButton; // Button for decreasing difficulty
-let skipTo16Button; // DEBUG: Button to skip to level 16
-let iWinButton; // DEBUG: Button to trigger win screen
+let upArrowButton; // Button for increasing difficulty on the intro screen
+let downArrowButton; // Button for decreasing difficulty on the intro screen
+let debugSkipLevelButton; // DEBUG: Button to skip to a specific level for testing.
 
 /**
  * Pre-calculates and caches the hexes within a certain range for every hex on the board.
@@ -348,6 +304,19 @@ function precalculateHexRanges() {
     console.log("Hex ranges pre-calculated and cached.");
 }
 
+/**
+ * Pre-calculates and caches a map from hex coordinates to their index in the hexagon array.
+ * This is a one-time operation at startup to significantly speed up coordinate-based lookups,
+ * such as when moving a cannon's threat area.
+ */
+function precalculateCoordMap() {
+    for (let i = 0; i < hexagon.length; i++) {
+        const key = `${hexagon[i].xHex},${hexagon[i].yHex}`;
+        hexCoordMap.set(key, i);
+    }
+    console.log("Hex coordinate map pre-calculated and cached.");
+}
+
 function getHexesInRange(startIndex, range) {
     // First, try to retrieve the pre-calculated result from the cache.
     if (hexRangeCache.has(startIndex) && hexRangeCache.get(startIndex).has(range)) {
@@ -382,7 +351,71 @@ function getHexesInRange(startIndex, range) {
     return Array.from(hexesInRange);
 }
 
-let zoomInButton;
+class Hexagon {
+    constructor(xHex, yHex, zone, adjacencies, mapsToNewZone = null) {
+        this.xHex = xHex;
+        this.yHex = yHex;
+        this.zone = zone;
+        this.adjacencies = adjacencies;
+        this.mapsToNewZone = mapsToNewZone; // The new zone this hex becomes when its zone is zoomed into
+        this.unit = 0;
+        this.team = 0;
+    }
+
+    draw(index, overrideColor = null) {
+        // 1. Determine fill and stroke colors based on game state.
+        let fillColor = overrideColor || zoneColor[this.zone];
+        let strokeColor = color(0); // Default black
+        let sw = r / 18; // Default stroke weight
+
+        // Highlight for selected zone (lower priority)
+        if (zoomInAnimationState.phase === 'inactive' && gameState.selectedZone === this.zone) {
+            strokeColor = color(255, 255, 0); // Yellow outline for selected zone
+            sw = 3;
+            // Darken the fill color to "shade" the selected zone.
+            fillColor = lerpColor(fillColor, color(0), 0.3);
+        }
+
+        if (zoomOutAnimationState.phase === 'inactive' && gameState.selected !== -1 && gameState.validMoves.has(index)) {
+            strokeColor = color(0, 106, 255); // Lighter blue for valid move
+            sw = 4;
+            fillColor = color(129, 133, 129); // Greenish fill for valid move
+        } else if (zoomOutAnimationState.phase === 'inactive' && gameState.selected === index) {
+            strokeColor = color(4, 0, 255); // Blue outline for selected
+            sw = 4;
+            fillColor = color(105, 101, 101); // Grey fill for selected
+        }
+
+        // 2. Apply styles and draw the hexagon shape.
+        stroke(strokeColor);
+        strokeWeight(sw);
+        fill(fillColor);
+
+        const pos = hexToXY(this.xHex, this.yHex);
+        beginShape();
+        vertex(pos.x, pos.y - r);
+        vertex(pos.x + r * sqrt(3) / 2, pos.y - r / 2);
+        vertex(pos.x + r * sqrt(3) / 2, pos.y + r / 2);
+        vertex(pos.x, pos.y + r);
+        vertex(pos.x - r * sqrt(3) / 2, pos.y + r / 2);
+        vertex(pos.x - r * sqrt(3) / 2, pos.y - r / 2);
+        endShape(CLOSE);
+    }
+
+    showCoordinates(index) {
+        const pos = hexToXY(this.xHex, this.yHex);
+        fill(0);
+        noStroke();
+        textAlign(CENTER, CENTER);
+        textSize(12);
+        text(index, pos.x, pos.y);
+        textAlign(LEFT, BASELINE); // Reset alignment
+    }
+}
+
+
+
+
 
                                     // mapsToNewZone
 hexagon[0] = new Hexagon(3, 1, 1, [1, 4, 5], 6);
@@ -683,21 +716,76 @@ function drawUnitWalking(xHexF, yHexF, unit, team)    {
 };
 
 /**
+ * @private
+ * Calculates a potential cannon target group based on an aiming hex.
+ * @param {number} aimingHexIndex - The index of the hex being aimed at.
+ * @param {Array<number>} potentialTargets - The list of hexes in the cannon's firing ring.
+ * @returns {Array<number>} An array of hex indices that form the target group.
+ */
+function _calculateCannonTargetGroup(aimingHexIndex, potentialTargets) {
+    if (aimingHexIndex === -1) return [];
+
+    const ringSet = new Set(potentialTargets);
+    const newTargetGroup = [];
+    const aimingHex = hexagon[aimingHexIndex];
+
+    // Check if the aiming point itself is a valid target.
+    if (ringSet.has(aimingHexIndex)) {
+        newTargetGroup.push(aimingHexIndex);
+    }
+
+    // Check each of the aiming point's neighbors.
+    if (aimingHex && aimingHex.adjacencies) {
+        for (const neighborIndex of aimingHex.adjacencies) {
+            if (ringSet.has(neighborIndex)) {
+                newTargetGroup.push(neighborIndex);
+            }
+        }
+    }
+    return newTargetGroup;
+}
+
+/**
  * Draws the UI for cannon targeting, highlighting the ring of potential targets.
  */
 function drawCannonTargetingUI() {
-    // Part 1: Draw persistent threats from ALL cannons for this turn
-    for (const [cannonIndex, threatenedHexes] of gameState.cannonThreats.entries()) {
-        // Only draw if the cannon is still on the board and belongs to the player
-        if (hexagon[cannonIndex].unit === 4 && hexagon[cannonIndex].team === PLAYER_TEAM) {
-            for (const hexIndex of threatenedHexes) {
-                const hex = hexagon[hexIndex];
-                const pos = hexToXY(hex.xHex, hex.yHex);
-                fill(139, 0, 0, 100); // Dark red for a set threat
-                noStroke();
-                drawMiniHexagon(pos.x, pos.y, r);
+    // Part 1: Draw persistent threats from all cannons on the board.
+
+    // First, count how many cannons from each team threaten each hex. This allows us to
+    // draw a thicker border for hexes threatened by multiple cannons.
+    const threatsByHex = new Map();
+    for (const [cannonIndex, threatData] of gameState.cannonThreats.entries()) {
+        // Only consider threats from active cannons, regardless of team.
+        if (hexagon[cannonIndex].unit === 4) {
+            const team = hexagon[cannonIndex].team;
+            for (const hexIndex of threatData.threatenedHexes) {
+                if (!threatsByHex.has(hexIndex)) {
+                    threatsByHex.set(hexIndex, { [PLAYER_TEAM]: 0, [ENEMY_TEAM]: 0 });
+                }
+                threatsByHex.get(hexIndex)[team]++;
             }
         }
+    }
+
+    // Now, draw the borders based on the threat count and team.
+    for (const [hexIndex, threatInfo] of threatsByHex.entries()) {
+        const hex = hexagon[hexIndex];
+        const pos = hexToXY(hex.xHex, hex.yHex);
+        noFill();
+
+        // Prioritize enemy threat color if both teams threaten the same hex.
+        let strokeColor;
+        let weight = 4;
+        if (threatInfo[ENEMY_TEAM] > 0) {
+            strokeColor = color(139, 0, 0); // Dark red for enemy threat
+            weight = (threatInfo[ENEMY_TEAM] >= 2) ? 8 : 4;
+        } else if (threatInfo[PLAYER_TEAM] > 0) {
+            strokeColor = color(0, 0, 139); // Dark blue for player threat
+            weight = (threatInfo[PLAYER_TEAM] >= 2) ? 8 : 4;
+        } else { continue; } // Should not happen, but as a safeguard.
+        stroke(strokeColor);
+        strokeWeight(weight);
+        drawMiniHexagon(pos.x, pos.y, r);
     }
 
     // Only draw if a cannon is selected and it has potential targets.
@@ -705,42 +793,21 @@ function drawCannonTargetingUI() {
         return;
     }
 
-    // Dynamically find the target group based on the hovered hex.
-    gameState.highlightedCannonTargetGroup = null;
-    const ringSet = new Set(gameState.potentialCannonTargets);
+    // If we are in aiming mode, the highlight is locked, so we don't update it.
+    // Otherwise, it's a live preview that follows the mouse.
+    if (!gameState.cannonIsAiming) {
+        gameState.highlightedCannonTargetGroup = null;
+        const aimingHexIndex = findClosestHexToMouse();
+        gameState.lastAimingHexIndex = aimingHexIndex;
 
-    // Find the hex on the board physically closest to the mouse cursor.
-    // This hex acts as the "aiming point" for the blast, even if it's not in the firing ring itself.
-    const aimingHexIndex = findClosestHexToMouse();
+        const hoveredHexIndex = findClickedHex();
 
-    // First, check if the mouse is *directly over* a valid move hex.
-    const hoveredHexIndex = findClickedHex();
-
-    // If the mouse is directly over a valid move destination, do not show a firing highlight.
-    // This prevents UI confusion between moving and firing.
-    if (hoveredHexIndex !== -1 && gameState.validMoves.has(hoveredHexIndex)) {
-        gameState.highlightedCannonTargetGroup = null; // Explicitly clear the highlight
-    } else {
-        // Otherwise, the mouse is in empty space or over a non-moveable hex.
-        // Proceed with the "aiming point" logic to calculate the highlight.
-        if (aimingHexIndex !== -1) {
-            const newHighlightedGroup = [];
-            const aimingHex = hexagon[aimingHexIndex];
-
-            // Check if the aiming point itself is a valid target.
-            if (ringSet.has(aimingHexIndex)) {
-                newHighlightedGroup.push(aimingHexIndex);
+        if (hoveredHexIndex !== -1 && gameState.validMoves.has(hoveredHexIndex)) {
+            gameState.highlightedCannonTargetGroup = null; // Explicitly clear the highlight
+        } else {
+            if (aimingHexIndex !== -1) {
+                gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroup(aimingHexIndex, gameState.potentialCannonTargets);
             }
-
-            // Check each of the aiming point's neighbors.
-            if (aimingHex && aimingHex.adjacencies) {
-                for (const neighborIndex of aimingHex.adjacencies) {
-                    if (ringSet.has(neighborIndex)) {
-                        newHighlightedGroup.push(neighborIndex);
-                    }
-                }
-            }
-            gameState.highlightedCannonTargetGroup = newHighlightedGroup;
         }
     }
 
@@ -759,7 +826,8 @@ function drawCannonTargetingUI() {
             const hex = hexagon[hexIndex];
             const pos = hexToXY(hex.xHex, hex.yHex);
 
-            fill(255, 0, 0, 150); // More opaque red
+            // Use blue for the player's aiming preview to distinguish from the AI's red.
+            fill(0, 0, 255, 150); // More opaque blue
             stroke(255, 255, 0); // Yellow border
             strokeWeight(3);
             drawMiniHexagon(pos.x, pos.y, r);
@@ -780,6 +848,7 @@ const STATUS_MESSAGES = {
     9: { size: 20, lines: ["Where to?"], x: 130, y: -180 },
     10: { size: 20, lines: ["Select target", "hexes"], x: [115, 125], y: [-188, -167] },
     11: { size: 20, lines: ["Move or Select", "target hexes"], x: [115, 125], y: [-188, -167] },
+    12: { size: 20, lines: ["Tap again to confirm", "or aim elsewhere"], x: [115, 125], y: [-188, -167] },
 };
 
 /**
@@ -815,7 +884,9 @@ function showStatusMessage() {
             const canMove = gameState.validMoves.size > 0;
             const canFire = gameState.potentialCannonTargets.length > 0;
 
-            if (canMove && canFire) {
+            if (gameState.cannonIsAiming) {
+                messageKey = 12; // "Tap again to confirm..."
+            } else if (canMove && canFire) {
                 messageKey = 11; // "Move or Select target hexes"
             } else if (canFire) {
                 messageKey = 10; // "Select target hexes"
@@ -904,6 +975,26 @@ function drawScoutMessage() {
 }
 
 /**
+ * @private
+ * A generic helper to draw informational messages at the bottom of the screen.
+ * This consolidates the styling and positioning logic from several other functions.
+ * @param {string} message - The text content of the message.
+ */
+function _drawBottomScreenMessage(message) {
+    // Position the message vertically below the board.
+    const boardBottomY = 200 * boardScale;
+    const messageY = boardBottomY + 30 * boardScale; // Position below the board
+
+    fill(50, 50, 150); // A dark, strategic blue
+    textSize(14 * boardScale);
+    textAlign(CENTER, CENTER);
+
+    const boxWidth = width * 0.5; // Make it narrower to avoid UI collision
+    const boxX = -boxWidth / 2;
+
+    text(message, boxX, messageY, boxWidth);
+}
+/**
  * Draws a message at the bottom of the screen explaining cannon units.
  * This message is only shown on level 5.
  */
@@ -912,21 +1003,8 @@ function drawCannonMessage() {
     if (gameState.level !== 5 || gameState.hasBeenOnLevel5) {
         return;
     }
-
-    const message = `Cannons are powerful but slow, moving only one hex. Control a zone with a 4-unit advantage to get a cannon on the next level.`;
-
-    // Position the message vertically below the board.
-    const boardBottomY = 200 * boardScale;
-    const messageY = boardBottomY + 30 * boardScale; // Position below the board
-
-    fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale); // Made text smaller
-    textAlign(CENTER, CENTER);
-
-    const boxWidth = width * 0.5; // Make it narrower to avoid UI collision
-    const boxX = -boxWidth / 2;
-
-    text(message, boxX, messageY, boxWidth);
+    const message = `Cannons must be aimed to function but attack at double strength. A 4-unit advantage in a zone creates a cannon on the next level.`;
+    _drawBottomScreenMessage(message);
 }
 /**
  * Draws a message at the bottom of the screen explaining cavalry units.
@@ -937,21 +1015,8 @@ function drawCavalryMessage() {
     if (gameState.level !== 2 || gameState.hasBeenOnLevel2) {
         return;
     }
-
     const message = `Cavalry fight like soldiers, but can travel 2 hexes per move. Control a zone with a 3-unit advantage to get a cavalry on the next level.`;
-
-    // Position the message vertically below the board.
-    const boardBottomY = 200 * boardScale;
-    const messageY = boardBottomY + 30 * boardScale; // Position below the board
-
-    fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale); // Made text smaller
-    textAlign(CENTER, CENTER);
-
-    const boxWidth = width * 0.5; // Make it narrower to avoid UI collision
-    const boxX = -boxWidth / 2;
-
-    text(message, boxX, messageY, boxWidth);
+    _drawBottomScreenMessage(message);
 }
 
 /**
@@ -963,21 +1028,8 @@ function drawArcherMessage() {
     if (gameState.level !== 3 || gameState.hasBeenOnLevel3) {
         return;
     }
-
     const message = `Archers engage enemies on adjacent hexes and from 2 hexes away.  Control a zone with a 6 or 7 unit advantage to create an archer on the next level.`;
-
-    // Position the message vertically below the board.
-    const boardBottomY = 200 * boardScale;
-    const messageY = boardBottomY + 30 * boardScale; // Position below the board
-
-    fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale); // Made text smaller
-    textAlign(CENTER, CENTER);
-
-    const boxWidth = width * 0.5; // Make it narrower to avoid UI collision
-    const boxX = -boxWidth / 2;
-
-    text(message, boxX, messageY, boxWidth);
+    _drawBottomScreenMessage(message);
 }
 
 /**
@@ -996,19 +1048,7 @@ function drawZoomOutTargetMessage() {
     const targetLevelName = LEVEL_NAMES[higherLevel - 1] || `Level ${higherLevel}`;
 
     const message = `You are fighting for Zone ${targetZone} on ${targetLevelName}.`;
-
-    // Use the same positioning and style as the other bottom-screen messages.
-    const boardBottomY = 200 * boardScale;
-    const messageY = boardBottomY + 30 * boardScale; // Position below the board
-
-    fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale);
-    textAlign(CENTER, CENTER);
-
-    const boxWidth = width * 0.5;
-    const boxX = -boxWidth / 2;
-
-    text(message, boxX, messageY, boxWidth);
+    _drawBottomScreenMessage(message);
 }
 
 /**
@@ -1126,9 +1166,9 @@ function isSurrounded(targetHexIndex, attackingTeam) {
     const directNeighborSet = new Set(hexagon[targetHexIndex].adjacencies);
 
     // 2. Check for persistent cannon threats first.
-    for (const [cannonIndex, threatenedHexes] of gameState.cannonThreats.entries()) {
+    for (const [cannonIndex, threatData] of gameState.cannonThreats.entries()) {
         // A cannon's threat only counts if it belongs to the attacking team and is targeting the hex.
-        if (hexagon[cannonIndex].team === attackingTeam && threatenedHexes.includes(targetHexIndex)) {
+        if (hexagon[cannonIndex].team === attackingTeam && threatData.threatenedHexes.includes(targetHexIndex)) {
             totalThreats += 2; // Cannons provide 2 threats to their target area.
         }
     }
@@ -1217,6 +1257,36 @@ function checkZoneControl(zone, team) {
 }
 
 /**
+ * @private
+ * Determines the type of unit that will be created on the next level based on zone dominance.
+ * This function is data-driven, using the `SPECIAL_UNIT_PROMOTION_RULES` constant to make
+ * the logic for unit promotion a single, extensible source of truth.
+ * @param {number} advantage - The unit advantage (e.g., player units - enemy units).
+ * @param {Set<number>} presentSpecialUnits - A set of special unit types already in the zone.
+ * @param {number} nextLevel - The level number that the unit will be carried over TO.
+ * @returns {number} The unit type (1: Soldier, 2: Archer, 3: Cavalry, 4: Cannon).
+ */
+function _getCarryoverUnitType(advantage, presentSpecialUnits, nextLevel) {
+    for (const rule of SPECIAL_UNIT_PROMOTION_RULES) {
+        const hasUnit = presentSpecialUnits.has(rule.unitType);
+
+        // Check for creation via advantage
+        const canCreateByAdvantage = advantage >= rule.advantage;
+
+        // Check level requirements for creation
+        let levelRequirementMet = nextLevel >= rule.minLevel;
+        if (rule.specialLevelCheck) {
+            levelRequirementMet = levelRequirementMet || rule.specialLevelCheck();
+        }
+
+        if (hasUnit || (canCreateByAdvantage && levelRequirementMet)) {
+            return rule.unitType;
+        }
+    }
+    return 1; // Default to Soldier
+}
+
+/**
  * Calculates which team has dominance in each zone at the end of a level.
  * Dominance is achieved by having at least 2 more units than the opponent.
  * Also determines the unit type that will carry over to the next level's center board.
@@ -1233,41 +1303,20 @@ function calculateZoneDominance() { // Simplified archer logic
         const playerUnitCount = playerUnitsInZone.length;
         const enemyUnitCount = enemyUnitsInZone.length;
 
-        // Default to no winner and soldier unit type
-        zoneDominance[zone] = { team: 0, unitType: 1 };
-
         const playerAdvantage = playerUnitCount - enemyUnitCount;
+        const enemyAdvantage = enemyUnitCount - playerUnitCount;
+
         if (playerAdvantage >= 2) {
-            zoneDominance[zone].team = PLAYER_TEAM;
-            const playerHasArcher = playerUnitsInZone.some(unit => unit.unit === 2);
-            const playerHasCannon = playerUnitsInZone.some(unit => unit.unit === 4);
-            const playerHasCavalry = playerUnitsInZone.some(unit => unit.unit === 3);
-
-            // New rules for player carryover based on advantage and presence
-            if ((playerAdvantage >= 6 || playerHasArcher) && (gameState.level + 1 >= 3)) {
-                zoneDominance[zone].unitType = 2; // Archer for 6+ advantage or presence
-            } else if ((playerAdvantage >= 4 || playerHasCannon) && (gameState.level + 1 >= 5)) {
-                zoneDominance[zone].unitType = 4; // Cannon for 4+ advantage or presence
-            } else if ((playerAdvantage >= 3 || playerHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
-                zoneDominance[zone].unitType = 3; // Cavalry for 3+ advantage or presence
-            }
+            const presentSpecialUnits = new Set(playerUnitsInZone.filter(u => u.unit > 1).map(u => u.unit));
+            const unitType = _getCarryoverUnitType(playerAdvantage, presentSpecialUnits, gameState.level + 1);
+            zoneDominance[zone] = { team: PLAYER_TEAM, unitType: unitType };
+        } else if (enemyAdvantage >= 2) {
+            const presentSpecialUnits = new Set(enemyUnitsInZone.filter(u => u.unit > 1).map(u => u.unit));
+            const unitType = _getCarryoverUnitType(enemyAdvantage, presentSpecialUnits, gameState.level + 1);
+            zoneDominance[zone] = { team: ENEMY_TEAM, unitType: unitType };
         } else {
-            const enemyAdvantage = enemyUnitCount - playerUnitCount;
-            if (enemyAdvantage >= 2) {
-                zoneDominance[zone].team = ENEMY_TEAM;
-                const enemyHasArcher = enemyUnitsInZone.some(unit => unit.unit === 2);
-                const enemyHasCannon = enemyUnitsInZone.some(unit => unit.unit === 4);
-                const enemyHasCavalry = enemyUnitsInZone.some(unit => unit.unit === 3);
-
-                // AI carryover rules
-                if ((enemyAdvantage >= 6 || enemyHasArcher) && (gameState.level + 1 >= 3)) {
-                    zoneDominance[zone].unitType = 2; // Archer for 6+ advantage or presence
-                } else if ((enemyAdvantage >= 4 || enemyHasCannon) && (gameState.level + 1 >= 5)) {
-                    zoneDominance[zone].unitType = 4; // Cannon for 4+ advantage or presence
-                } else if ((enemyAdvantage >= 3 || enemyHasCavalry) && (gameState.level >= 2 || gameState.hasBeenOnLevel2)) {
-                    zoneDominance[zone].unitType = 3; // Cavalry for 3+ advantage or presence
-                }
-            }
+            // No team has dominance.
+            zoneDominance[zone] = { team: 0, unitType: 1 };
         }
     }
     return zoneDominance;
@@ -1491,7 +1540,9 @@ function generateZoomInBoard(sourceZone) {
         }
     }
 
-    _addDebugCannon(boardState);
+    // DEBUG: Add a player cannon for testing on the new lower level.
+    _addPlayerCannonForTesting(boardState);
+
     return boardState;
 }
 
@@ -1579,7 +1630,6 @@ function generateInitialBoardState() {
     for (const [hexIndex, state] of outerZonePlacements.entries()) {
         boardState[hexIndex] = { unit: state.unit, team: state.team };
     }
-    _addDebugCannon(boardState);
     return boardState;
 }
 
@@ -1589,12 +1639,6 @@ function generateInitialBoardState() {
  */
 function startNewLevel() {
     console.log(`Starting Level: ${gameState.level + 1}`);
-
-    // This function should only run for the initial setup (level 0 -> 1)
-    if (gameState.level > 0) {
-        console.error("startNewLevel() was called for a subsequent level. This should be handled by the animation state machine.");
-        return;
-    }
 
     // 1. Generate the complete board state for Level 1.
     const initialBoardState = generateInitialBoardState();
@@ -1606,13 +1650,10 @@ function startNewLevel() {
     }
 
     // 4. Reset game state for the new level
-    gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: gameState.level + 1, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map() };
-    if (gameState.level >= 3) { // Introduce AI archers from level 3
-        _convertRandomSoldier(hexagon, ENEMY_TEAM, 2, 'archer');
-    }
-    if (gameState.level >= 2) { // Introduce AI cavalry from level 2
-        _convertRandomSoldier(hexagon, ENEMY_TEAM, 3, 'cavalry');
-    }
+    gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 1, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
+
+    // DEBUG: Add a player cannon for testing on level 1.
+    _addPlayerCannonForTesting(hexagon);
 }
 
 /**
@@ -1716,6 +1757,31 @@ function evaluateMove(sourceIndex, destIndex) {
 }
 
 /**
+ * Evaluates a potential cannon threat action for the AI and returns a score.
+ * @param {number} cannonIndex - The index of the cannon setting the threat.
+ * @param {Array<number>} targetGroup - The array of hex indices in the threat area.
+ * @returns {number} The calculated score for setting the threat.
+ */
+function evaluateThreatAction(cannonIndex, targetGroup) {
+    let score = 0;
+    // Add a small base score for using the cannon at all
+    score += AI_SCORING_WEIGHTS.SETUP_KILL;
+
+    for (const hexIndex of targetGroup) {
+        const hex = hexagon[hexIndex];
+        if (hex.team === PLAYER_TEAM) {
+            // Use CREATE_KILL as a base score for hitting any unit.
+            score += AI_SCORING_WEIGHTS.CREATE_KILL;
+            // Add bonuses for high-value targets.
+            if (hex.unit === 2) score += AI_SCORING_WEIGHTS.KILL_ARCHER_BONUS;
+            if (hex.unit === 4) score += AI_SCORING_WEIGHTS.KILL_CANNON_BONUS;
+            if (hex.unit === 3) score += AI_SCORING_WEIGHTS.KILL_CAVALRY_BONUS;
+        }
+    }
+    return score;
+}
+
+/**
  * @private
  * Converts a random soldier of a specific team to a different unit type.
  * This is a generic helper function to avoid code duplication.
@@ -1745,37 +1811,44 @@ function _convertRandomSoldier(board, team, newUnitType, unitTypeName, excludedZ
         console.log(`No ${teamName} soldiers found to convert to ${unitTypeName} (excluding zone ${excludedZone}).`);
     }
 }
+
 /**
  * @private
- * Adds a player cannon to an empty hex for debugging purposes.
- * @param {Array<{unit: number, team: number}>} board - The board state array to modify.
+ * DEBUG: Adds a player cannon to the board for testing purposes.
+ * It prioritizes placing the cannon on an empty hex in an outer zone.
+ * If no empty hex is available, it will convert a random player soldier.
+ * @param {Array<Hexagon> | Array<{unit: number, team: number}>} board - The array of hexagon objects or board state objects.
  */
-function _addDebugCannon(board) {
-    // Find an empty hex to place the cannon. Prioritize Zone 7.
-    const emptyHexesInZone7 = ZONE_7_HEX_INDICES.filter(i => board[i].unit === 0);
-    let hexToPlaceCannon = -1;
+function _addPlayerCannonForTesting(board) {
+    // Find potential hexes for the cannon. Prioritize empty hexes in outer zones.
+    const emptyOuterHexes = [];
+    const playerSoldiers = [];
 
-    if (emptyHexesInZone7.length > 0) {
-        hexToPlaceCannon = random(emptyHexesInZone7);
-    } else {
-        // Fallback: find any empty hex on the board.
-        const allEmptyHexes = [];
-        for (let i = 0; i < board.length; i++) {
+    for (let i = 0; i < board.length; i++) {
+        const hexZone = hexagon[i].zone; // Always check the zone from the main hexagon definition
+        if (hexZone !== 7) { // Only place in outer zones to avoid immediate conflict
             if (board[i].unit === 0) {
-                allEmptyHexes.push(i);
+                emptyOuterHexes.push(i);
+            } else if (board[i].team === PLAYER_TEAM && board[i].unit === 1) {
+                playerSoldiers.push(i);
             }
-        }
-        if (allEmptyHexes.length > 0) {
-            hexToPlaceCannon = random(allEmptyHexes);
         }
     }
 
-    if (hexToPlaceCannon !== -1) {
-        board[hexToPlaceCannon].unit = 4; // Cannon
-        board[hexToPlaceCannon].team = PLAYER_TEAM;
-        console.log(`DEBUG: Added player cannon at hex ${hexToPlaceCannon}.`);
+    let targetHexIndex = -1;
+    if (emptyOuterHexes.length > 0) {
+        targetHexIndex = random(emptyOuterHexes);
+        console.log(`DEBUG: Adding player cannon for testing to empty hex ${targetHexIndex}.`);
+    } else if (playerSoldiers.length > 0) {
+        targetHexIndex = random(playerSoldiers);
+        console.log(`DEBUG: Converting player soldier to cannon for testing at hex ${targetHexIndex}.`);
+    }
+
+    if (targetHexIndex !== -1) {
+        board[targetHexIndex].unit = 4; // Cannon
+        board[targetHexIndex].team = PLAYER_TEAM;
     } else {
-        console.warn("DEBUG: Could not find an empty hex to place a debug cannon.");
+        console.log("DEBUG: Could not find a suitable spot for a test player cannon.");
     }
 }
 /**
@@ -1813,6 +1886,25 @@ function findBestAIMove() {
                     bestMove = { from: i, to: destIndex, score: score };
                 }
             }
+
+            // If the unit is a cannon, also evaluate setting a threat.
+            if (sourceHex.unit === 4) {
+                const hexesAtRange1 = getHexesInRange(i, 1);
+                const hexesAtRange2 = getHexesInRange(i, 2);
+                const potentialTargets = hexesAtRange2.filter(h => !hexesAtRange1.includes(h));
+
+                // To simplify, iterate through all hexes on the board as potential aiming points.
+                // A smarter AI would be more selective, but this ensures functionality.
+                for (let aimingIndex = 0; aimingIndex < hexagon.length; aimingIndex++) {
+                    const targetGroup = _calculateCannonTargetGroup(aimingIndex, potentialTargets);
+                    if (targetGroup.length > 0) {
+                        const score = evaluateThreatAction(i, targetGroup);
+                        if (score > bestMove.score) {
+                            bestMove = { from: i, to: -1, score: score, type: 'set_threat', aimingIndex: aimingIndex };
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1825,6 +1917,20 @@ function findBestAIMove() {
  * @param {{from: number, to: number}} move - The move to execute.
  */
 function executeAIMove(move) {
+    // Handle the "set threat" action type for cannons by triggering an animation.
+    if (move.type === 'set_threat') {
+        // Recalculate the target group to ensure it's accurate at the moment of execution.
+        const hexesAtRange1 = getHexesInRange(move.from, 1);
+        const hexesAtRange2 = getHexesInRange(move.from, 2);
+        const potentialTargets = hexesAtRange2.filter(h => !hexesAtRange1.includes(h));
+        const targetGroup = _calculateCannonTargetGroup(move.aimingIndex, potentialTargets);
+
+        // Set the animation state instead of directly setting the threat.
+        gameState.animateCannonThreat = { cannonIndex: move.from, targetGroup: targetGroup, aimingIndex: move.aimingIndex, duration: 60 }; // 1 second
+        gameState.aiZonesMovedFromThisTurn.add(hexagon[move.from].zone);
+        return;
+    }
+
     const sourceHex = hexagon[move.from];
     const destinationHex = hexagon[move.to];
 
@@ -1844,23 +1950,27 @@ function executeAIMove(move) {
     gameState.animateMovementTo = move.to;
 }
 
-function calculateAllThreats(attackingTeam)   {
-        var unitsToRemove = [];
-        // First pass: identify all units that are surrounded.
-        for (var hexLoop = 0; hexLoop < hexagon.length; hexLoop++) {
-            if (isSurrounded(hexLoop, attackingTeam)) {
-                unitsToRemove.push(hexLoop);
-            }
+/**
+ * Finds and removes all units for the defending team that are surrounded.
+ * This is done in two passes to prevent a unit's removal from saving another.
+ * @param {number} attackingTeam - The team currently on the offensive.
+ */
+function resolveSurroundCombat(attackingTeam) {
+    const unitsToRemove = [];
+    // First pass: identify all units that are surrounded.
+    for (let i = 0; i < hexagon.length; i++) {
+        if (isSurrounded(i, attackingTeam)) {
+            unitsToRemove.push(i);
         }
+    }
 
-        // Second pass: remove the units.
-        for (var i = 0; i < unitsToRemove.length; i++) {
-            var hexNumber = unitsToRemove[i];
-            hexagon[hexNumber].unit = 0;
-            hexagon[hexNumber].team = 0;
-            if (sounds.boom2) sounds.boom2.play();
-        }
-    };
+    // Second pass: remove the units.
+    for (const hexIndex of unitsToRemove) {
+        hexagon[hexIndex].unit = 0;
+        hexagon[hexIndex].team = 0;
+        if (sounds.boom2) sounds.boom2.play();
+    }
+}
 
 // State for the win screen and level transition animation
 let zoomOutAnimationState; // Initialized in setup()
@@ -1906,11 +2016,8 @@ function prepareNextLevelBoard(nextLevel, bonusArcher = false) {
         populateTargetZone(nextLevelBoard, targetZoneNum, zoneDominance);
 
         // Generate new units for the outer zones.
-        populateNewOuterZones(nextLevelBoard, targetZoneNum);
+        populateNewOuterZones(nextLevelBoard, targetZoneNum, nextLevel); // Pass the level we are generating for.
     }
-
-    // Add a debug cannon for testing purposes.
-    _addDebugCannon(nextLevelBoard);
 
     // --- Handle the bonus archer AFTER the board is generated ---
     if (bonusArcher && gameState.secretArcherZone) {
@@ -1943,6 +2050,9 @@ function prepareNextLevelBoard(nextLevel, bonusArcher = false) {
             nextLevelBoard[targetHexIndex].team = PLAYER_TEAM;
         }
     }
+
+    // DEBUG: Add a player cannon for testing on the new higher level.
+    _addPlayerCannonForTesting(nextLevelBoard);
 
     return { board: nextLevelBoard, targetZone: targetZoneNum };
 }
@@ -1994,25 +2104,22 @@ function populateTargetZone(board, targetZone, zoneDominance) {
  * Populates the outer zones of a given board state with new, randomly generated units.
  * This is used when advancing to a level for the first time.
  * @param {Array<{unit: number, team: number}>} board - The board state array to modify.
- * @param {number} excludedZone - The zone number to exclude from random unit conversion.
+ * @param {number | null} excludedZone - The zone number to exclude from random unit conversion.
+ * @param {number} levelToGenerate - The level number for which to generate units.
  */
-function populateNewOuterZones(board, excludedZone) {
+function populateNewOuterZones(board, excludedZone, levelToGenerate) {
     console.log(`Generating new board state for outer zones.`);
     const outerZonePlacements = generateOuterZoneUnits();
     for (const [hexIndex, state] of outerZonePlacements.entries()) {
         board[hexIndex] = { unit: state.unit, team: state.team };
     }
-    const nextLevel = gameState.level + 1;
-    // Ensure the AI always has at least one archer on a new level.
-    if (nextLevel >= 3) {
+    if (levelToGenerate >= 3) {
         _convertRandomSoldier(board, ENEMY_TEAM, 2, 'archer', excludedZone);
     }
-    // Ensure the AI gets a cavalry unit on new levels starting from level 2.
-    if (nextLevel >= 2) {
-        _convertRandomSoldier(board, ENEMY_TEAM, 3, 'c cavalry', excludedZone);
+    if (levelToGenerate >= 2) {
+        _convertRandomSoldier(board, ENEMY_TEAM, 3, 'cavalry', excludedZone);
     }
-    // Ensure the AI gets a cannon unit on new levels starting from level 5.
-    if (nextLevel >= 5) {
+    if (levelToGenerate >= 5) {
         _convertRandomSoldier(board, ENEMY_TEAM, 4, 'cannon', excludedZone);
     }
 }
@@ -2101,14 +2208,13 @@ function updateLayout() {
     // --- Re-initialize all UI buttons with new positions and sizes ---
 
     // Game Screen Buttons
-    fire = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "End", "Turn");
-    skipTo16Button = new Button(fire.x, fire.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 16"); // DEBUG
-    iWinButton = new Button(skipTo16Button.x, skipTo16Button.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "I Win", null); // DEBUG
+    endTurnButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "End", "Turn");
+    debugSkipLevelButton = new Button(endTurnButton.x, endTurnButton.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 5"); // DEBUG
     zoomOutButton = new Button(edgeMargin, edgeMargin, mainButtonRadius, "Zoom", "Out", 'out');
     zoomInButton = new Button(edgeMargin, edgeMargin + mainButtonRadius * 2 + buttonSpacing, mainButtonRadius, "Zoom", "In", 'in');
 
-    // Intro and Instructions Screen Buttons
-    continueButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Continue", null);
+    // Intro and Instructions Screen Buttons. Renamed for clarity.
+    newGameButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "New Game", null);
     startButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Start", null);
 
     // Difficulty adjustment buttons for the intro screen
@@ -2145,6 +2251,11 @@ function updateLayout() {
 function setup() {
     createCanvas(windowWidth, windowHeight);
 
+    // The loadGameState() call is commented out to prevent the game from
+    // automatically loading a saved state. This ensures you always start
+    // from the intro screen.
+    // loadGameState();
+
     // --- Pre-calculate hexagon lookups by zone for efficiency ---
     for (let i = 1; i <= 7; i++) {
         hexesByZone.set(i, []);
@@ -2153,6 +2264,7 @@ function setup() {
         hexesByZone.get(hexagon[i].zone).push(hexagon[i]);
     }
     precalculateHexRanges(); // One-time calculation for performance
+    precalculateCoordMap();
 
     // Initialize colors (must be done in setup or draw in p5.js)
     zoneColor = [
@@ -2165,6 +2277,15 @@ function setup() {
         color(81, 191, 67),
         color(232, 42, 229)
     ];
+
+    // Adjust sound volumes for better balance.
+    // The "boom" sounds are loud, so they are reduced to make other sounds audible.
+    if (sounds.boom1) sounds.boom1.setVolume(0.5);
+    if (sounds.boom2) sounds.boom2.setVolume(0.5);
+    if (sounds.select) sounds.select.setVolume(1.0);
+    if (sounds.selectEnemy) sounds.selectEnemy.setVolume(1.0);
+    if (sounds.error) sounds.error.setVolume(0.7);
+    if (sounds.move) sounds.move.setVolume(0.8);
 
     teamColors = [
         {mainColor: color(245, 8, 8), secondaryColor: color(47, 0, 255)}, //dummy
@@ -2293,8 +2414,8 @@ function drawIntroScreen() {
              difficultyNumberX - arrowSize, downArrowRelativeY - arrowSize,
              difficultyNumberX + arrowSize, downArrowRelativeY - arrowSize);
 
-    // Continue Button
-    continueButton.draw(true); // Always active on intro screen
+    // New Game Button
+    newGameButton.draw(true); // Always active on intro screen
     pop();
 }
 
@@ -2454,8 +2575,8 @@ function updateZoomOutAnimationState() {
             zoomOutAnimationState.revealTimer--;
             if (zoomOutAnimationState.revealTimer <= 0) {
                 // Final pause is over. Reset for the next level.
-                const nextLevel = gameState.level + 1;                
-                gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map() };
+                const nextLevel = gameState.level + 1;
+                gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
                 gameState.introScreenDifficulty = DIFFICULTY; // Sync intro screen difficulty with current game difficulty
                 zoomOutAnimationState.phase = 'inactive';
             }
@@ -2494,9 +2615,8 @@ function drawGameUI() {
 
     // Draw turn-specific UI for the player
     if (gameState.isPlayerTurn) {
-        fire.draw(gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1); // Pass active state
-        skipTo16Button.draw(true); // DEBUG
-        // iWinButton.draw(true); // DEBUG
+        endTurnButton.draw(gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1); // Pass active state
+        debugSkipLevelButton.draw(true); // DEBUG
         drawScoutMessage();
         showStatusMessage();
     }
@@ -2523,8 +2643,8 @@ function handleAITurn() {
         return;
     }
 
-    // If no unit movement animation is playing, decide the next AI action.
-    if (gameState.animateMovementTo === null) {
+    // If no movement or cannon animation is playing, decide the next AI action.
+    if (gameState.animateMovementTo === null && gameState.animateCannonThreat === null) {
         const bestMove = findBestAIMove();
 
         // Condition to end the turn: No move is possible, OR it's not the first move and the best move isn't beneficial (score <= 0).
@@ -2603,6 +2723,52 @@ function drawFinalWinScreen() {
 }
 
 /**
+ * Draws the flashing animation for an AI cannon setting a threat.
+ * This function also handles the state transition after the animation completes,
+ * setting the permanent threat on the board.
+ */
+function drawCannonThreatAnimation() {
+    if (!gameState.animateCannonThreat) {
+        return;
+    }
+
+    const { cannonIndex, targetGroup, duration, aimingIndex } = gameState.animateCannonThreat;
+
+    // Create a flashing effect by only drawing the highlight on certain frames.
+    // This will flash on for 10 frames, off for 10, etc.
+    if (floor(duration / 10) % 2 === 1) {
+        const cannonHex = hexagon[cannonIndex];
+        const cannonPos = hexToXY(cannonHex.xHex, cannonHex.yHex);
+
+        // Highlight the cannon itself
+        fill(255, 0, 0, 180); // Semi-transparent red
+        stroke(255, 255, 0); // Yellow border
+        strokeWeight(4);
+        drawMiniHexagon(cannonPos.x, cannonPos.y, r);
+
+        // Highlight the target hexes
+        for (const hexIndex of targetGroup) {
+            const hex = hexagon[hexIndex];
+            const pos = hexToXY(hex.xHex, hex.yHex);
+            drawMiniHexagon(pos.x, pos.y, r);
+        }
+    }
+
+    // Decrement the timer.
+    gameState.animateCannonThreat.duration--;
+
+    // When the animation is over, set the permanent threat.
+    if (gameState.animateCannonThreat.duration <= 0) {
+        const cannonHex = hexagon[cannonIndex];
+        const aimingHex = hexagon[aimingIndex];
+        const relativeAim = { dx: aimingHex.xHex - cannonHex.xHex, dy: aimingHex.yHex - cannonHex.yHex };
+        gameState.cannonThreats.set(cannonIndex, { threatenedHexes: targetGroup, relativeAim: relativeAim });
+        if (sounds.boom2) sounds.boom2.play();
+        gameState.animateCannonThreat = null; // End the animation
+    }
+}
+
+/**
  * Draws the main game screen when the game is in progress.
  * This function is the main dispatcher for the active game state, handling
  * animations, board drawing, and UI rendering.
@@ -2625,6 +2791,7 @@ function drawMainGame() {
         drawGameBoard();
         drawAllUnits();
         drawCannonTargetingUI();
+        drawCannonThreatAnimation();
         drawAnimation();
     }
     pop();
@@ -2635,6 +2802,8 @@ function drawMainGame() {
     }
     handleAITurn();
 }
+
+
 
 // draws board, color circles, coordinates, soldiers, (error)messages
 function draw() {
@@ -2781,7 +2950,7 @@ function drawZoomInAnimation() {
 
             // 3. Reset game state for the new, lower level.
             const nextLevel = gameState.level - 1;
-            gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map() };
+            gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
             zoomInAnimationState.phase = 'inactive'; // Reset the animation state machine
         }
     }
@@ -2901,7 +3070,7 @@ function drawGameBoard() {
     for (let i = 0; i < hexagon.length; i++) {
         const hex = hexagon[i];
         hex.draw(i);
-        hex.showCoordinates(i);
+        // hex.showCoordinates(i); // DEBUG: Temporarily disabled for a cleaner UI.
     }
 }
 
@@ -2945,13 +3114,13 @@ function drawAnimation() {
 
         // After a move completes, check for standard surround combat for the active player.
         if (wasPlayerTurn) {
-            calculateAllThreats(PLAYER_TEAM);
+            resolveSurroundCombat(PLAYER_TEAM);
             // Check player's zone control
             for (let zone = 1; zone <= 7; zone++) {
                 checkZoneControl(zone, PLAYER_TEAM);
             }
         } else {
-            calculateAllThreats(ENEMY_TEAM);
+            resolveSurroundCombat(ENEMY_TEAM);
             // Check AI's zone control
             for (let zone = 1; zone <= 7; zone++) {
                 checkZoneControl(zone, ENEMY_TEAM);
@@ -3034,7 +3203,7 @@ function handleSelectUnit(clickedIndex) {
             return; // Exit after handling the cannon selection.
         }
 
-        // Standard selection logic for all other units (or cannons that have already fired).
+        // Standard selection logic for all other units (or cannons that have already set a threat).
         if (hasMovedFromZone) {
             if (sounds.error) sounds.error.play();
             gameState.badClick = 6; // "Already moved from this zone."
@@ -3059,12 +3228,96 @@ function handleSelectUnit(clickedIndex) {
 }
 
 /**
+ * @private
+ * Handles the specific logic for a player's cannon action, which can be aiming,
+ * confirming a target, or re-aiming. This extracts a complex state machine
+ * from the main `handleMoveUnit` function.
+ * @param {number} clickedIndex - The index of the hex that was clicked (or -1).
+ * @returns {boolean} True if a cannon-specific action was handled, false otherwise.
+ */
+function _handleCannonAction(clickedIndex) {
+    if (gameState.cannonIsAiming) {
+        // Player is in aiming mode. Decide whether to confirm, re-aim, or cancel.
+        // A click on the cannon itself cancels aiming mode.
+        if (clickedIndex === gameState.selected) {
+            gameState.cannonIsAiming = false;
+            gameState.lockedAimingHexIndex = null;
+            // The highlight will be recalculated on the next draw frame.
+            return true; // Action handled: canceled aiming.
+        }
+
+        const newAimingHexIndex = findClosestHexToMouse();
+        if (newAimingHexIndex === gameState.lockedAimingHexIndex) {
+            // --- CONFIRM & SET THREAT ---
+            // The user clicked the same spot again. Confirm the target.
+            const cannonHex = hexagon[gameState.selected];
+            const aimingHex = hexagon[gameState.lockedAimingHexIndex];
+            const relativeAim = {
+                dx: aimingHex.xHex - cannonHex.xHex,
+                dy: aimingHex.yHex - cannonHex.yHex
+            };
+            gameState.cannonThreats.set(gameState.selected, {
+                threatenedHexes: gameState.highlightedCannonTargetGroup,
+                relativeAim: relativeAim
+            });
+            gameState.cannonsFiredThisTurn.add(gameState.selected);
+
+            if (sounds.select) sounds.select.play();
+            gameState.selected = -1;
+            gameState.validMoves.clear();
+            gameState.potentialCannonTargets = [];
+            gameState.highlightedCannonTargetGroup = null;
+            gameState.lastAimingHexIndex = null;
+            gameState.cannonIsAiming = false;
+            gameState.lockedAimingHexIndex = null;
+            return true; // Action handled: threat set.
+        } else {
+            // --- RE-AIM ---
+            // The user clicked a different spot. Update the aim.
+            gameState.lockedAimingHexIndex = newAimingHexIndex;
+            gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroup(newAimingHexIndex, gameState.potentialCannonTargets);
+            // If the new aim is invalid (no targets), cancel aiming mode.
+            if (gameState.highlightedCannonTargetGroup.length === 0) {
+                gameState.cannonIsAiming = false;
+                gameState.lockedAimingHexIndex = null;
+            }
+            return true; // Action handled: re-aimed.
+        }
+    } else if (gameState.highlightedCannonTargetGroup && gameState.highlightedCannonTargetGroup.length > 0) {
+        // --- ENTER AIMING MODE ---
+        // A first click on a valid target area locks the aim.
+        gameState.cannonIsAiming = true;
+        gameState.lockedAimingHexIndex = gameState.lastAimingHexIndex;
+        // The highlighted group is already set by the UI, so it's now "locked".
+        return true; // Action handled: entered aiming mode.
+    }
+    // If we reach here, no cannon-specific action was taken. The click might be a move.
+    return false;
+}
+/**
  * Handles the logic for when a unit is already selected and a hex is clicked.
  * @param {number} clickedIndex - The index of the hex that was clicked.
  */
 function handleMoveUnit(clickedIndex) {
-    const clickedHex = hexagon[clickedIndex];
     const selectedHex = hexagon[gameState.selected];
+
+    // --- Cannon Action Logic ---
+    if (selectedHex.unit === 4) {
+        // Delegate to the helper. If it handles the action (returns true), we're done.
+        if (_handleCannonAction(clickedIndex)) {
+            return;
+        }
+    }
+    // --- Standard Click Logic (requires clicking ON a hex) ---
+    // If we reach here, it means the cannon didn't set a threat or aim.
+    // All subsequent logic requires a valid hex click.
+    if (clickedIndex === -1) {
+        if (sounds.error) sounds.error.play();
+        gameState.badClick = 3; // "Can't go there"
+        return;
+    }
+
+    const clickedHex = hexagon[clickedIndex];
 
     if (clickedIndex === gameState.selected) {
         gameState.selected = -1; // Deselect by clicking the same unit
@@ -3082,29 +3335,52 @@ function handleMoveUnit(clickedIndex) {
         // Record the zone this move originated from.
         gameState.zonesMovedFromThisTurn.add(selectedHex.zone);
 
-        // If a cannon that has fired this turn moves, update its tracking.
-        if (selectedHex.unit === 4 && gameState.cannonsFiredThisTurn.has(gameState.selected)) {
-            // Update the 'fired' status to track the cannon at its new location.
-            gameState.cannonsFiredThisTurn.delete(gameState.selected);
-            gameState.cannonsFiredThisTurn.add(clickedIndex);
+        // If a cannon that has a threat area moves, the threat must move with it.
+        if (selectedHex.unit === 4 && gameState.cannonThreats.has(gameState.selected)) {
+            // If the cannon also set its threat *this turn*, we need to update that tracking set as well.
+            // This prevents it from setting another threat in the same turn after moving.
+            if (gameState.cannonsFiredThisTurn.has(gameState.selected)) {
+                gameState.cannonsFiredThisTurn.delete(gameState.selected);
+                gameState.cannonsFiredThisTurn.add(clickedIndex);
+            }
+            
+            // Recalculate the threat area from the new position instead of just translating it.
+            // This ensures the threat area correctly reflects edge-of-board limitations.
+            const threatData = gameState.cannonThreats.get(gameState.selected);
+            const relativeAim = threatData.relativeAim;
 
-            // Move the threat area with the cannon.
-            const oldThreatArea = gameState.cannonThreats.get(gameState.selected); // This will exist if the cannon fired.
-            const dx = clickedHex.xHex - selectedHex.xHex;
-            const dy = clickedHex.yHex - selectedHex.yHex;
+            // Calculate the new aiming point based on the cannon's new position.
+            const newCannonHex = clickedHex;
+            const newAimingHexX = newCannonHex.xHex + relativeAim.dx;
+            const newAimingHexY = newCannonHex.yHex + relativeAim.dy;
+            const newAimingHexIndex = hexCoordMap.get(`${newAimingHexX},${newAimingHexY}`);
 
+            // Recalculate the threat area from the new position.
             const newThreatArea = [];
-            for (const threatHexIndex of oldThreatArea) {
-                const threatHex = hexagon[threatHexIndex];
-                const newThreatHexX = threatHex.xHex + dx;
-                const newThreatHexY = threatHex.yHex + dy;
-                const newThreatHexIndex = hexagon.findIndex(h => h.xHex === newThreatHexX && h.yHex === newThreatHexY);
-                if (newThreatHexIndex !== -1) {
-                    newThreatArea.push(newThreatHexIndex);
+            if (newAimingHexIndex !== undefined) {
+                // The cannon's new firing ring.
+                const hexesAtRange1 = getHexesInRange(clickedIndex, 1);
+                const hexesAtRange2 = getHexesInRange(clickedIndex, 2);
+                const ringSet = new Set(hexesAtRange2.filter(h => !hexesAtRange1.includes(h)));
+
+                // The new aiming hex and its neighbors.
+                const aimingHex = hexagon[newAimingHexIndex];
+                const potentialBlastArea = [newAimingHexIndex, ...aimingHex.adjacencies];
+
+                // The new threat area is the intersection of the blast area and the new firing ring.
+                for (const hexIndex of potentialBlastArea) {
+                    if (ringSet.has(hexIndex)) {
+                        newThreatArea.push(hexIndex);
+                    }
                 }
             }
+
+            // Update the cannonThreats map with the new key (the destination index) and new data.
             gameState.cannonThreats.delete(gameState.selected);
-            gameState.cannonThreats.set(clickedIndex, newThreatArea);
+            gameState.cannonThreats.set(clickedIndex, {
+                threatenedHexes: newThreatArea,
+                relativeAim: relativeAim // The relative aim stays the same
+            });
         }
 
         // Explicitly move the unit and clear the source hex.
@@ -3126,24 +3402,6 @@ function handleMoveUnit(clickedIndex) {
         if (gameState.zonesMovedFromThisTurn.size >= 7) {
             gameState.endTurn = 1;
             gameState.badClick = 5; // "No more moves"
-        }
-    } else if (hexagon[gameState.selected].unit === 4) {
-        // Check if the click was a "set threat" command for a cannon.
-        // The highlightedCannonTargetGroup is dynamically calculated on hover.
-        // If it exists when the player clicks, that's the chosen target.
-        if (gameState.highlightedCannonTargetGroup) {
-            // SET THREAT!
-            gameState.cannonThreats.set(gameState.selected, gameState.highlightedCannonTargetGroup);
-            gameState.cannonsFiredThisTurn.add(gameState.selected);
-
-            // Play a sound and clean up the UI state.
-            if (sounds.boom1) sounds.boom1.play();
-            gameState.selected = -1;
-            gameState.validMoves.clear();
-            gameState.potentialCannonTargets = [];
-            gameState.highlightedCannonTargetGroup = null;
-
-            return; // Action complete.
         }
     } else if (clickedHex.unit !== 0 && clickedHex.team === PLAYER_TEAM) {
         // Clicked on another friendly unit, so select it instead, if its zone is available.
@@ -3198,7 +3456,7 @@ function handleZoneSelection(clickedIndex) {
  */
 function handleMenuScreenClick() {
     if (gameState.currentScreen === 'intro') {
-        if (continueButton.pressed()) {
+        if (newGameButton.pressed()) {
             gameState.currentScreen = 'instructions';
             return;
         }
@@ -3224,19 +3482,24 @@ function handleMenuScreenClick() {
  */
 function handleBoardClick() {
     const clickedIndex = findClickedHex();
-    if (clickedIndex === -1) {
-        return; // Click was outside any hex
-    }
 
     // If in zone selection mode, a click on any hex selects that zone.
     if (gameState.zoneSelectionMode) {
-        handleZoneSelection(clickedIndex);
+        // Zone selection requires clicking ON a hex.
+        if (clickedIndex !== -1) {
+            handleZoneSelection(clickedIndex);
+        }
         return; // Stop further processing
     }
 
     if (gameState.selected === -1) {
-        handleSelectUnit(clickedIndex);
+        // No unit is selected. We must click ON a hex to select one.
+        if (clickedIndex !== -1) {
+            handleSelectUnit(clickedIndex);
+        }
     } else {
+        // A unit IS selected. Pass the click to the move handler.
+        // It can handle clicks on hexes (move/re-select) or empty space (cannon fire).
         handleMoveUnit(clickedIndex);
     }
 }
@@ -3248,30 +3511,23 @@ function handleBoardClick() {
 function handleDebugButtons() {
     // This function should only be active during development.
     // For now, we'll just check if the buttons exist.
-    if (!iWinButton || !skipTo16Button) return false;
+    if (!debugSkipLevelButton) return false;
 
-    // if (iWinButton.pressed() && gameState.isPlayerTurn) {
-    //     gameState.level = LEVEL_NAMES.length; // Set to final level
-    //     // Remove all enemy units to trigger win condition
-    //     for (const hex of hexagon) {
-    //         if (hex.team === ENEMY_TEAM) {
-    //             hex.unit = 0;
-    //             hex.team = 0;
-    //         }
-    //     }
-    //     return true;
-    // }
+    if (debugSkipLevelButton.pressed() && gameState.isPlayerTurn) {
+        // --- Skip directly to level 5 without animation ---
+        console.log("DEBUG: Skipping directly to Level 5.");
+        
+        // 1. Set the game state for the new level FIRST so that board generation has the correct context.
+        gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 5, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
+        DIFFICULTY = 4; // Level 5 difficulty is 4
 
-    if (skipTo16Button.pressed() && gameState.isPlayerTurn) {
-        // --- Skip directly to level 16 without animation ---
-        console.log("DEBUG: Skipping directly to Level 16.");
-
-        DIFFICULTY = 15;
+        // 2. Generate the new board state.
         const newBoard = [];
         for (let i = 0; i < hexagon.length; i++) {
             newBoard[i] = { unit: 0, team: 0 };
         }
 
+        // Populate Zone 7 (center)
         const zone7UnitPool = [ENEMY_TEAM, ENEMY_TEAM, ENEMY_TEAM, PLAYER_TEAM, PLAYER_TEAM, 0, 0];
         shuffle(zone7UnitPool, true);
         for (let i = 0; i < ZONE_7_HEX_INDICES.length; i++) {
@@ -3279,14 +3535,13 @@ function handleDebugButtons() {
             const team = zone7UnitPool[i];
             newBoard[hexIndex] = { unit: (team === 0) ? 0 : 1, team: team };
         }
-
-        populateNewOuterZones(newBoard);
-
+        // Populate Outer Zones, passing `null` for the excluded zone since we're creating a full new board.
+        populateNewOuterZones(newBoard, null, gameState.level);
+        // 3. Apply the new board state to the game.
         for (let i = 0; i < hexagon.length; i++) {
             hexagon[i].unit = newBoard[i].unit;
             hexagon[i].team = newBoard[i].team;
         }
-            gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 16, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map() };
         if (sounds.boom2) sounds.boom2.play();
         return true;
     }
@@ -3358,14 +3613,18 @@ function handleZoomButtons() {
 }
 
 function handleEndTurnButton() {
-    if (fire.pressed()) {
+    if (endTurnButton.pressed()) {
         // End the turn if at least one move has been made, or if all possible moves have been made.
         if (gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1) {
+            // Deselect any active unit to clean up the UI state for the AI's turn.
+            gameState.selected = -1;
+            gameState.validMoves.clear();
+            gameState.potentialCannonTargets = [];
+
             gameState.zonesMovedFromThisTurn.clear();
             gameState.aiMovesMadeThisTurn = 0; // Reset AI move counter
             gameState.aiZonesMovedFromThisTurn.clear(); // Reset AI moves for its turn
             gameState.endTurn = 0;
-            gameState.cannonThreats.clear();
             gameState.cannonsFiredThisTurn.clear();
             gameState.badClick = 0;
             gameState.playerTurnCount++;
