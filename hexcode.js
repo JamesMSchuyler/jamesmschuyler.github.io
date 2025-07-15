@@ -267,6 +267,7 @@ let startButton; // Button on the instructions screen
 let upArrowButton; // Button for increasing difficulty on the intro screen
 let downArrowButton; // Button for decreasing difficulty on the intro screen
 let debugSkipLevelButton; // DEBUG: Button to skip to a specific level for testing.
+let mainMenuButton;
 
 /**
  * Pre-calculates and caches the hexes within a certain range for every hex on the board.
@@ -2210,9 +2211,10 @@ function updateLayout() {
     debugSkipLevelButton = new Button(endTurnButton.x, endTurnButton.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 5"); // DEBUG
     zoomOutButton = new Button(edgeMargin, edgeMargin, mainButtonRadius, "Zoom", "Out", 'out');
     zoomInButton = new Button(edgeMargin, edgeMargin + mainButtonRadius * 2 + buttonSpacing, mainButtonRadius, "Zoom", "In", 'in');
+    mainMenuButton = new Button(width - edgeMargin, edgeMargin, mainButtonRadius, "New", "Game");
 
     // Intro and Instructions Screen Buttons. Renamed for clarity.
-    newGameButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "New Game", null);
+    newGameButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Continue", null);
     startButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Start", null);
 
     // Difficulty adjustment buttons for the intro screen
@@ -2249,11 +2251,35 @@ function updateLayout() {
 function setup() {
     createCanvas(windowWidth, windowHeight);
 
-    // The loadGameState() call is commented out to prevent the game from
-    // automatically loading a saved state. This ensures you always start
-    // from the intro screen.
-    // loadGameState();
+    // Initialize the animation state machines BEFORE loading the game state.
+    // This ensures that a loaded state can correctly overwrite the defaults.
+    zoomOutAnimationState = {
+        phase: 'inactive', // inactive, shrinking, paused, revealing, recoloring_pause, final_reveal, complete
+        progress: 0, // For the shrinking/moving animation
+        targetZoneForReveal: 7, // The zone on the new board being revealed
+        revealMap: new Map(), // Maps old zone number -> new hex index
+        targetZoneCenterPos: { x: 0, y: 0 }, // The screen-space coordinates for the center of the target zone
+        pauseTimer: 0,
+        revealTimer: 0, // For revealing Zone 7 hexes one by one
+        revealedZones: 0, // How many of the 7 zones have been revealed
+        zoneRevealOrder: [1, 2, 3, 4, 5, 6, 7], // The order to reveal zones
+        nextLevelBoard: null // Stores the pre-calculated state of the next level's board
+    };
+    zoomInAnimationState = { 
+        phase: 'inactive', // inactive, fading_out, expanding, recoloring, revealing, finalizing, complete 
+        sourceZone: null,
+        progress: 0,
+        startPos: { x: 0, y: 0 },
+        precalculatedBoard: null,
+        recolorTimer: 0,
+        recoloredHexes: 0,
+        // The order to recolor the 7 hexes of the expanded zone
+        recolorOrder: [] 
+    };
 
+    // Load the game state if it exists. If a valid state is loaded,
+    // the game will resume. Otherwise, it will start on the intro screen.
+    loadGameState();
     // --- Pre-calculate hexagon lookups by zone for efficiency ---
     for (let i = 1; i <= 7; i++) {
         hexesByZone.set(i, []);
@@ -2290,31 +2316,6 @@ function setup() {
         {mainColor: color(8, 8, 8), secondaryColor: color(232, 225, 225)}, //player1
         {mainColor: color(161, 3, 3), secondaryColor: color(7, 176, 100)}  //player2(or AI)
     ];
-
-    // Initialize the zoom-out animation state machine
-    zoomOutAnimationState = {
-        phase: 'inactive', // inactive, shrinking, paused, revealing, recoloring_pause, final_reveal, complete
-        progress: 0, // For the shrinking/moving animation
-        targetZoneForReveal: 7, // The zone on the new board being revealed
-        revealMap: new Map(), // Maps old zone number -> new hex index
-        targetZoneCenterPos: { x: 0, y: 0 }, // The screen-space coordinates for the center of the target zone
-        pauseTimer: 0,
-        revealTimer: 0, // For revealing Zone 7 hexes one by one
-        revealedZones: 0, // How many of the 7 zones have been revealed
-        zoneRevealOrder: [1, 2, 3, 4, 5, 6, 7], // The order to reveal zones
-        nextLevelBoard: null // Stores the pre-calculated state of the next level's board
-    };
-    zoomInAnimationState = { 
-        phase: 'inactive', // inactive, fading_out, expanding, recoloring, revealing, finalizing, complete 
-        sourceZone: null,
-        progress: 0,
-        startPos: { x: 0, y: 0 },
-        precalculatedBoard: null,
-        recolorTimer: 0,
-        recoloredHexes: 0,
-        // The order to recolor the 7 hexes of the expanded zone
-        recolorOrder: [] 
-    };
 
     // Calculate the initial layout for all UI elements
     updateLayout();
@@ -2577,6 +2578,7 @@ function updateZoomOutAnimationState() {
                 gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: nextLevel, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
                 gameState.introScreenDifficulty = DIFFICULTY; // Sync intro screen difficulty with current game difficulty
                 zoomOutAnimationState.phase = 'inactive';
+                saveGameState(); // Save the new level state immediately
             }
             break;
     }
@@ -2596,6 +2598,7 @@ function drawGameUI() {
     const canZoomIn = gameState.isPlayerTurn && gameState.level > 1 && gameState.zonesMovedFromThisTurn.size === 0;
     zoomOutButton.draw(canZoomOut);
     zoomInButton.draw(canZoomIn, gameState.zoneSelectionMode);
+    mainMenuButton.draw(true); // Always available
 
     // Draw Level Number and Name (positioned to the right of Zoom Out button)
     const levelTextSize = 48; // Increased from 24
@@ -3610,6 +3613,18 @@ function handleZoomButtons() {
     return false;
 }
 
+function handleMainMenuButton() {
+    if (mainMenuButton && mainMenuButton.pressed()) {
+        // Return to the intro screen and clear the saved game.
+        // This allows the player to start a fresh game.
+        gameState.currentScreen = 'intro';
+        localStorage.removeItem('zoomBftmSaveState');
+        console.log("New game started. Previous save state cleared.");
+        return true;
+    }
+    return false;
+}
+
 function handleEndTurnButton() {
     if (endTurnButton.pressed()) {
         // End the turn if at least one move has been made, or if all possible moves have been made.
@@ -3641,19 +3656,14 @@ function mouseClicked() {
     userStartAudio();
 
     // Block all input if the game has been won.
-    if (gameState.gameWon || zoomInAnimationState.phase !== 'inactive') {
+    // Also block input during the zoom-out level transition.
+    if (gameState.gameWon || zoomInAnimationState.phase !== 'inactive' || zoomOutAnimationState.phase !== 'inactive') {
         return;
     }
 
     // Handle clicks on pre-game screens (intro, instructions)
     if (gameState.currentScreen === 'intro' || gameState.currentScreen === 'instructions') {
         handleMenuScreenClick();
-        return;
-    }
-
-    // Block all input if a unit movement animation is playing to prevent
-    // interrupting the animation and skipping the combat phase.
-    if (gameState.animateMovementTo !== null) {
         return;
     }
 
@@ -3664,6 +3674,11 @@ function mouseClicked() {
 
     // Handle zoom buttons
     if (handleZoomButtons()) {
+        return;
+    }
+
+    // Handle main menu button
+    if (handleMainMenuButton()) {
         return;
     }
 
