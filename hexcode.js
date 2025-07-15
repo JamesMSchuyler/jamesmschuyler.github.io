@@ -57,10 +57,10 @@ const AI_SCORING_WEIGHTS = {
  */
 const SPECIAL_UNIT_PROMOTION_RULES = [
     // Rules should be ordered by priority (strongest unit first)
-    { unitType: 2, advantage: 6, minLevel: 3 }, // Archer
-    { unitType: 4, advantage: 4, minLevel: 5 }, // Cannon
-    // Cavalry has a special check: it can be created on level 2, OR any level if the player has been to level 2 before.
-    { unitType: 3, advantage: 3, minLevel: 2, specialLevelCheck: () => gameState.hasBeenOnLevel2 } // Cavalry
+    { unitType: 2, advantage: 6, minLevel: 4 }, // Archer
+    { unitType: 4, advantage: 4, minLevel: 6 }, // Cannon
+    // Cavalry can be created on level 3 or higher.
+    { unitType: 3, advantage: 3, minLevel: 3 } // Cavalry
 ];
 
 // Layout for the 7 dots in a hexagonal cluster for the "Moves Left" UI.
