@@ -1541,8 +1541,7 @@ function generateZoomInBoard(sourceZone) {
     }
 
     // DEBUG: Add a player cannon for testing on the new lower level.
-    _addPlayerCannonForTesting(boardState);
-
+    // _addPlayerCannonForTesting(boardState);
     return boardState;
 }
 
@@ -1653,7 +1652,7 @@ function startNewLevel() {
     gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 1, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
 
     // DEBUG: Add a player cannon for testing on level 1.
-    _addPlayerCannonForTesting(hexagon);
+    // _addPlayerCannonForTesting(hexagon);
 }
 
 /**
@@ -2052,8 +2051,7 @@ function prepareNextLevelBoard(nextLevel, bonusArcher = false) {
     }
 
     // DEBUG: Add a player cannon for testing on the new higher level.
-    _addPlayerCannonForTesting(nextLevelBoard);
-
+    // _addPlayerCannonForTesting(nextLevelBoard);
     return { board: nextLevelBoard, targetZone: targetZoneNum };
 }
 
