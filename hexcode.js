@@ -3262,7 +3262,7 @@ function drawGameBoard() {
     for (let i = 0; i < hexagon.length; i++) {
         const hex = hexagon[i];
         hex.draw(i);
-        hex.showCoordinates(i);
+        // hex.showCoordinates(i);
     }
 }
 
