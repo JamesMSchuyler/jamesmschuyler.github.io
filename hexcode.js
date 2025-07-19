@@ -119,9 +119,9 @@ function createDefaultGameState() {
         secretArcherZone: null,
         potentialCannonTargets: [],
         highlightedCannonTargetGroup: null,
-        lastAimingHexIndex: null,
         cannonIsAiming: false,
-        lockedAimingHexIndex: null,
+        lockedAimingDirectionIndex: null, // The aiming direction index (0-11) locked in by the player
+        lastAimingDirectionIndex: null, // The last aiming direction the mouse was indicating
         animateCannonThreat: null,
         cannonThreats: new Map(),
         cannonsFiredThisTurn: new Set(),
@@ -142,6 +142,9 @@ const ZONE_TO_ZONE_7_HEX_MAP = {
     7: 24  // Zone 7 -> Hex 24
 };
 const ZONE_7_HEX_INDICES = Object.values(ZONE_TO_ZONE_7_HEX_MAP);
+
+let CANNON_DIRECTIONS;
+let CANNON_AIM_OFFSETS;
 
 //converts x, y-ish hex coordinates to actual x, y position
 function hexToXY(xHexA, yHexA)   {
@@ -271,15 +274,6 @@ class Button {
         return dist(mouseX, mouseY, this.x, this.y) < (this.radius * 13 / 16);
     }
 }
-
-let endTurnButton; // Will be initialized in setup()
-let zoomOutButton; // New button for testing win screen
-let newGameButton; // Button on the intro screen
-let startButton; // Button on the instructions screen
-let upArrowButton; // Button for increasing difficulty on the intro screen
-let downArrowButton; // Button for decreasing difficulty on the intro screen
-let debugSkipLevelButton; // DEBUG: Button to skip to a specific level for testing.
-let mainMenuButton;
 
 /**
  * Pre-calculates and caches the hexes within a certain range for every hex on the board.
@@ -728,6 +722,87 @@ function drawUnitWalking(xHexF, yHexF, unit, team)    {
     _drawUnit(xHexF, yHexF, unit, team, true);
 };
 
+
+/**
+ * @private
+ * Determines the closest of the 12 discrete firing directions from a cannon to the mouse.
+ * @param {number} cannonIndex - The index of the cannon that is aiming.
+ * @returns {number} The direction index (0-11) that is closest to the mouse angle.
+ */
+function _getDirectionFromMouse(cannonIndex) {
+    const cannonPos = hexToXY(hexagon[cannonIndex].xHex, hexagon[cannonIndex].yHex);
+    const translatedMouseX = mouseX - (width / 2);
+    const translatedMouseY = mouseY - (height / 2);
+    const scaledMouseX = translatedMouseX / boardScale;
+    const scaledMouseY = translatedMouseY / boardScale;
+
+    const angle = atan2(scaledMouseY - cannonPos.y, scaledMouseX - cannonPos.x);
+
+    let closestDirection = -1;
+    let minAngleDiff = TWO_PI;
+
+    for (let i = 0; i < CANNON_DIRECTIONS.length; i++) {
+        let diff = abs(angle - CANNON_DIRECTIONS[i]);
+        if (diff > PI) {
+            diff = TWO_PI - diff;
+        }
+        if (diff < minAngleDiff) {
+            minAngleDiff = diff;
+            closestDirection = i;
+        }
+    }
+    return closestDirection;
+}
+
+/**
+ * @private
+ * Calculates a potential cannon target group based on a cannon's position and a firing direction.
+ * @param {number} cannonIndex - The index of the cannon firing.
+ * @param {number} directionIndex - The direction (0-11) the cannon is firing.
+ * @returns {Array<number>} An array of hex indices that form the target group.
+ */
+function _calculateCannonTargetGroupFromDirection(cannonIndex, directionIndex) {
+    const cannonHex = hexagon[cannonIndex];
+    const aimOffset = CANNON_AIM_OFFSETS[directionIndex];
+    const aimingHexX = cannonHex.xHex + aimOffset.dx;
+    const aimingHexY = cannonHex.yHex + aimOffset.dy;
+
+    // The cannon's firing ring.
+    const hexesAtRange1 = new Set(getHexesInRange(cannonIndex, 1));
+    const hexesAtRange2 = getHexesInRange(cannonIndex, 2);
+    const ringSet = new Set(hexesAtRange2.filter(h => !hexesAtRange1.has(h)));
+
+    // Define the 6 neighbor coordinate offsets for this grid system.
+    const neighborOffsets = [
+        { dx: -1, dy: -1 }, { dx: 0, dy: -1 }, { dx: -1, dy: 0 },
+        { dx: 1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 1, dy: 1 }
+    ];
+
+    // Calculate the coordinates of the aiming point and all its theoretical neighbors.
+    const potentialBlastCoords = [{ x: aimingHexX, y: aimingHexY }];
+    for (const offset of neighborOffsets) {
+        potentialBlastCoords.push({ x: aimingHexX + offset.dx, y: aimingHexY + offset.dy });
+    }
+
+    // Find which of these theoretical hexes actually exist on the board.
+    const potentialBlastArea = [];
+    for (const coords of potentialBlastCoords) {
+        const hexIndex = hexCoordMap.get(`${coords.x},${coords.y}`);
+        if (hexIndex !== undefined) {
+            potentialBlastArea.push(hexIndex);
+        }
+    }
+
+    // The new threat area is the intersection of the valid blast area and the cannon's firing ring.
+    const targetGroup = [];
+    for (const hexIndex of potentialBlastArea) {
+        if (ringSet.has(hexIndex)) {
+            targetGroup.push(hexIndex);
+        }
+    }
+    return targetGroup;
+}
+
 /**
  * @private
  * Calculates a potential cannon target group based on an aiming hex.
@@ -757,7 +832,27 @@ function _calculateCannonTargetGroup(aimingHexIndex, potentialTargets) {
     }
     return newTargetGroup;
 }
+function _getDirectionBetweenHexes(sourceIndex, aimIndex) {
+    const sourcePos = hexToXY(hexagon[sourceIndex].xHex, hexagon[sourceIndex].yHex);
+    const aimPos = hexToXY(hexagon[aimIndex].xHex, hexagon[aimIndex].yHex);
 
+    const angle = atan2(aimPos.y - sourcePos.y, aimPos.x - sourcePos.x);
+
+    let closestDirection = -1;
+    let minAngleDiff = TWO_PI;
+
+    for (let i = 0; i < CANNON_DIRECTIONS.length; i++) {
+        let diff = abs(angle - CANNON_DIRECTIONS[i]);
+        if (diff > PI) {
+            diff = TWO_PI - diff;
+        }
+        if (diff < minAngleDiff) {
+            minAngleDiff = diff;
+            closestDirection = i;
+        }
+    }
+    return closestDirection;
+}
 /**
  * Draws the UI for cannon targeting, highlighting the ring of potential targets.
  */
@@ -810,17 +905,16 @@ function drawCannonTargetingUI() {
     // Otherwise, it's a live preview that follows the mouse.
     if (!gameState.cannonIsAiming) {
         gameState.highlightedCannonTargetGroup = null;
-        const aimingHexIndex = findClosestHexToMouse();
-        gameState.lastAimingHexIndex = aimingHexIndex;
-
         const hoveredHexIndex = findClickedHex();
 
+        // If the mouse is over a valid move hex, don't show any aiming preview.
         if (hoveredHexIndex !== -1 && gameState.validMoves.has(hoveredHexIndex)) {
-            gameState.highlightedCannonTargetGroup = null; // Explicitly clear the highlight
+            gameState.lastAimingDirectionIndex = null;
         } else {
-            if (aimingHexIndex !== -1) {
-                gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroup(aimingHexIndex, gameState.potentialCannonTargets);
-            }
+            // Otherwise, determine the aiming direction from the mouse position.
+            const directionIndex = _getDirectionFromMouse(gameState.selected);
+            gameState.lastAimingDirectionIndex = directionIndex;
+            gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroupFromDirection(gameState.selected, directionIndex);
         }
     }
 
@@ -849,19 +943,19 @@ function drawCannonTargetingUI() {
 }
 
 const STATUS_MESSAGES = {
-    1: { size: 20, lines: ["Click on Unit"], x: 120, y: -180 },
-    2: { size: 20, lines: ["Move to Open Hex"], x: 115, y: -180 },
-    3: { size: 20, lines: ["Can't go there"], x: 120, y: -180 },
-    4: { size: 20, lines: ["Click on your", "own units,", "dude!"], x: [115, 130, 145], y: [-188, -167, -146] },
-    5: { size: 20, lines: ["No more moves.", "Click 'End Turn'"], x: [115, 125], y: [-188, -167] },
-    6: { size: 20, lines: ["Already moved", "from this zone."], x: [115, 125], y: [-188, -167] },
-    7: { size: 20, lines: ["Click 'Zoom In' to", "confirm. Deselect", "zone to exit."], x: [115, 125, 135], y: [-188, -167, -146] },
+    1: { size: 20, lines: ["Click on Unit"], x: 120, y: -130 },
+    2: { size: 20, lines: ["Move to Open Hex"], x: 115, y: -130 },
+    3: { size: 20, lines: ["Can't go there"], x: 120, y: -130 },
+    4: { size: 20, lines: ["Click on your", "own units,", "dude!"], x: [128, 143, 158], y: [-143, -122, -101] },
+    5: { size: 20, lines: ["No more moves.", "Click 'End Turn'"], x: [115, 125], y: [-138, -117] },
+    6: { size: 20, lines: ["Already moved", "from this zone."], x: [115, 125], y: [-138, -117] },
+    7: { size: 20, lines: ["Click 'Zoom In' to", "confirm. Deselect", "zone to exit."], x: [115, 125, 135], y: [-138, -117, -96] },
     // Consolidated messages
-    8: { size: 20, lines: ["Select zone", "to Zoom in"], x: [115, 125], y: [-188, -167] },
-    9: { size: 20, lines: ["Where to?"], x: 130, y: -180 },
-    10: { size: 20, lines: ["Select target", "hexes"], x: [115, 125], y: [-188, -167] },
-    11: { size: 20, lines: ["Move or Select", "target hexes"], x: [115, 125], y: [-188, -167] },
-    12: { size: 20, lines: ["Tap again to confirm", "or aim elsewhere"], x: [115, 125], y: [-188, -167] },
+    8: { size: 20, lines: ["Select zone", "to Zoom in"], x: [115, 125], y: [-138, -117] },
+    9: { size: 20, lines: ["Where to?"], x: 130, y: -130 },
+    10: { size: 20, lines: ["Select target", "hexes"], x: [115, 125], y: [-138, -117] },
+    11: { size: 20, lines: ["Move or Select", "target hexes"], x: [115, 125], y: [-138, -117] },
+    12: { size: 20, lines: ["Tap again to confirm", "or aim elsewhere"], x: [115, 125], y: [-138, -117] },
 };
 
 /**
@@ -1973,41 +2067,17 @@ function executeAIMove(move) {
 
     // If a cannon that has a threat area moves, the threat must move with it.
     if (sourceHex.unit === 4 && gameState.cannonThreats.has(move.from)) {
-        // Recalculate the threat area from the new position.
         const threatData = gameState.cannonThreats.get(move.from);
-        const relativeAim = threatData.relativeAim;
-
-        // Calculate the new aiming point based on the cannon's new position.
-        const newCannonHex = destinationHex;
-        const newAimingHexX = newCannonHex.xHex + relativeAim.dx;
-        const newAimingHexY = newCannonHex.yHex + relativeAim.dy;
-        const newAimingHexIndex = hexCoordMap.get(`${newAimingHexX},${newAimingHexY}`);
+        const directionIndex = threatData.directionIndex;
 
         // Recalculate the threat area from the new position.
-        const newThreatArea = [];
-        if (newAimingHexIndex !== undefined) {
-            // The cannon's new firing ring.
-            const hexesAtRange1 = getHexesInRange(move.to, 1);
-            const hexesAtRange2 = getHexesInRange(move.to, 2);
-            const ringSet = new Set(hexesAtRange2.filter(h => !hexesAtRange1.includes(h)));
-
-            // The new aiming hex and its neighbors.
-            const aimingHex = hexagon[newAimingHexIndex];
-            const potentialBlastArea = [newAimingHexIndex, ...aimingHex.adjacencies];
-
-            // The new threat area is the intersection of the blast area and the new firing ring.
-            for (const hexIndex of potentialBlastArea) {
-                if (ringSet.has(hexIndex)) {
-                    newThreatArea.push(hexIndex);
-                }
-            }
-        }
+        const newThreatArea = _calculateCannonTargetGroupFromDirection(move.to, directionIndex);
 
         // Update the cannonThreats map with the new key (the destination index) and new data.
         gameState.cannonThreats.delete(move.from);
         gameState.cannonThreats.set(move.to, {
             threatenedHexes: newThreatArea,
-            relativeAim: relativeAim // The relative aim stays the same
+            directionIndex: directionIndex // The direction stays the same
         });
     }
 
@@ -2290,7 +2360,7 @@ function updateLayout() {
 
     // Game Screen Buttons
     endTurnButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "End", "Turn");
-    debugSkipLevelButton = new Button(endTurnButton.x, endTurnButton.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 5"); // DEBUG
+    // debugSkipLevelButton = new Button(endTurnButton.x, endTurnButton.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 5"); // DEBUG
     zoomOutButton = new Button(edgeMargin, edgeMargin, mainButtonRadius, "Zoom", "Out", 'out');
     zoomInButton = new Button(edgeMargin, edgeMargin + mainButtonRadius * 2 + buttonSpacing, mainButtonRadius, "Zoom", "In", 'in');
     mainMenuButton = new Button(width - edgeMargin, edgeMargin, mainButtonRadius, "New", "Game");
@@ -2332,6 +2402,40 @@ function updateLayout() {
 // p5.js setup function - runs once at the beginning
 function setup() {
     createCanvas(windowWidth, windowHeight);
+
+    // --- Dynamically generate cannon aiming constants based on grid geometry ---
+    // This ensures that the angles and coordinate offsets are perfectly synchronized.
+
+    // 1. Find a central hex to use as a reference point. Hex 24 (in Zone 7) is a good choice.
+    const referenceHexIndex = 24;
+    const referenceHex = hexagon[referenceHexIndex];
+    const referencePos = hexToXY(referenceHex.xHex, referenceHex.yHex);
+
+    // 2. Get all hexes in the cannon's firing ring (range 2, excluding range 1).
+    const hexesAtRange1 = getHexesInRange(referenceHexIndex, 1);
+    const hexesAtRange2 = getHexesInRange(referenceHexIndex, 2);
+    const firingRingHexes = hexesAtRange2
+        .filter(hIndex => !hexesAtRange1.includes(hIndex))
+        .map(hIndex => ({
+            index: hIndex,
+            hex: hexagon[hIndex],
+            pos: hexToXY(hexagon[hIndex].xHex, hexagon[hIndex].yHex)
+        }));
+
+    // 3. Calculate the angle of each hex in the ring relative to the reference hex.
+    for (const ringHex of firingRingHexes) {
+        ringHex.angle = atan2(ringHex.pos.y - referencePos.y, ringHex.pos.x - referencePos.x);
+    }
+
+    // 4. Sort the hexes by angle to ensure a consistent 0-11 direction index.
+    firingRingHexes.sort((a, b) => a.angle - b.angle);
+
+    // 5. Generate the final constant arrays from the sorted list.
+    CANNON_DIRECTIONS = firingRingHexes.map(rh => rh.angle);
+    CANNON_AIM_OFFSETS = firingRingHexes.map(rh => ({
+        dx: rh.hex.xHex - referenceHex.xHex,
+        dy: rh.hex.yHex - referenceHex.yHex
+    }));
 
     // Initialize the animation state machines BEFORE loading the game state.
     // This ensures that a loaded state can correctly overwrite the defaults.
@@ -2698,7 +2802,7 @@ function drawGameUI() {
     // Draw turn-specific UI for the player
     if (gameState.isPlayerTurn) {
         endTurnButton.draw(gameState.zonesMovedFromThisTurn.size > 0 || gameState.endTurn === 1); // Pass active state
-        debugSkipLevelButton.draw(true); // DEBUG
+        // debugSkipLevelButton.draw(true); // DEBUG
         drawScoutMessage();
         showStatusMessage();
     }
@@ -2775,30 +2879,38 @@ function drawFinalWinScreen() {
     const rotationPerFrame = TWO_PI / (30 * 60);
     gameState.winRotation += rotationPerFrame;
 
-    // 2. Apply rotation to the entire canvas
+    // 2. Apply a center translation and rotation to the entire scene
     push(); // Save the current drawing state
     translate(width / 2, height / 2);
     rotate(gameState.winRotation);
-    translate(-width / 2, -height / 2);
 
-    // 3. Draw the game board underneath, scaled and centered
+    // 3. Draw the game board underneath, scaled relative to the new center origin
     push();
-    translate(width / 2, height / 2);
     scale(boardScale);
     drawGameBoard();
     drawAllUnits();
     pop();
 
     // 4. Draw the "You Win!" text on top
-    // Draw "You" in the upper left
+    // Coordinates are now relative to the screen's center.
+    const textX1 = -width / 2 + 50 * boardScale;
+    const textY1 = -height / 2 + 50 * boardScale;
+    const textX2 = width / 2 - 50 * boardScale;
+    const textY2 = height / 2 - 50 * boardScale;
+
     fill(170, 0, 120); // Same color as "Zoom:" title
     textAlign(LEFT, TOP);
     textStyle(BOLD);
     textSize(200 * boardScale);
-    text("You", 50 * boardScale, 50 * boardScale);
+    text("You", textX1, textY1);
     textAlign(RIGHT, BOTTOM);
-    text("Win!", width - (50 * boardScale), height - (50 * boardScale));
+    text("Win!", textX2, textY2);
     textStyle(NORMAL); // Reset text style
+
+    // Draw the "New Game" button, which will rotate with the screen
+    if (mainMenuButton) {
+        mainMenuButton.draw(true);
+    }
 
     // 5. Restore the drawing state from the rotation
     pop();
@@ -2841,10 +2953,8 @@ function drawCannonThreatAnimation() {
 
     // When the animation is over, set the permanent threat.
     if (gameState.animateCannonThreat.duration <= 0) {
-        const cannonHex = hexagon[cannonIndex];
-        const aimingHex = hexagon[aimingIndex];
-        const relativeAim = { dx: aimingHex.xHex - cannonHex.xHex, dy: aimingHex.yHex - cannonHex.yHex };
-        gameState.cannonThreats.set(cannonIndex, { threatenedHexes: targetGroup, relativeAim: relativeAim });
+        const directionIndex = _getDirectionBetweenHexes(cannonIndex, aimingIndex);
+        gameState.cannonThreats.set(cannonIndex, { threatenedHexes: targetGroup, directionIndex: directionIndex });
         if (sounds.boom2) sounds.boom2.play();
         gameState.animateCannonThreat = null; // End the animation
     }
@@ -3323,45 +3433,41 @@ function _handleCannonAction(clickedIndex) {
         // A click on the cannon itself cancels aiming mode.
         if (clickedIndex === gameState.selected) {
             gameState.cannonIsAiming = false;
-            gameState.lockedAimingHexIndex = null;
+            gameState.lockedAimingDirectionIndex = null;
             // The highlight will be recalculated on the next draw frame.
             return true; // Action handled: canceled aiming.
         }
 
-        const newAimingHexIndex = findClosestHexToMouse();
-        if (newAimingHexIndex === gameState.lockedAimingHexIndex) {
+        const newAimingDirectionIndex = _getDirectionFromMouse(gameState.selected);
+        if (newAimingDirectionIndex === gameState.lockedAimingDirectionIndex) {
             // --- CONFIRM & SET THREAT ---
-            // The user clicked the same spot again. Confirm the target.
-            const cannonHex = hexagon[gameState.selected];
-            const aimingHex = hexagon[gameState.lockedAimingHexIndex];
-            const relativeAim = {
-                dx: aimingHex.xHex - cannonHex.xHex,
-                dy: aimingHex.yHex - cannonHex.yHex
-            };
+            // The user clicked in the same direction again. Confirm the target.
+
             gameState.cannonThreats.set(gameState.selected, {
                 threatenedHexes: gameState.highlightedCannonTargetGroup,
-                relativeAim: relativeAim
+                directionIndex: gameState.lockedAimingDirectionIndex
             });
             gameState.cannonsFiredThisTurn.add(gameState.selected);
 
             if (sounds.select) sounds.select.play();
+            // Reset all selection and aiming state.
             gameState.selected = -1;
             gameState.validMoves.clear();
             gameState.potentialCannonTargets = [];
             gameState.highlightedCannonTargetGroup = null;
-            gameState.lastAimingHexIndex = null;
+            gameState.lastAimingDirectionIndex = null;
             gameState.cannonIsAiming = false;
-            gameState.lockedAimingHexIndex = null;
+            gameState.lockedAimingDirectionIndex = null;
             return true; // Action handled: threat set.
         } else {
             // --- RE-AIM ---
-            // The user clicked a different spot. Update the aim.
-            gameState.lockedAimingHexIndex = newAimingHexIndex;
-            gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroup(newAimingHexIndex, gameState.potentialCannonTargets);
+            // The user clicked a different direction. Update the aim.
+            gameState.lockedAimingDirectionIndex = newAimingDirectionIndex;
+            gameState.highlightedCannonTargetGroup = _calculateCannonTargetGroupFromDirection(gameState.selected, newAimingDirectionIndex);
             // If the new aim is invalid (no targets), cancel aiming mode.
             if (gameState.highlightedCannonTargetGroup.length === 0) {
                 gameState.cannonIsAiming = false;
-                gameState.lockedAimingHexIndex = null;
+                gameState.lockedAimingDirectionIndex = null;
             }
             return true; // Action handled: re-aimed.
         }
@@ -3369,143 +3475,91 @@ function _handleCannonAction(clickedIndex) {
         // --- ENTER AIMING MODE ---
         // A first click on a valid target area locks the aim.
         gameState.cannonIsAiming = true;
-        gameState.lockedAimingHexIndex = gameState.lastAimingHexIndex;
+        gameState.lockedAimingDirectionIndex = gameState.lastAimingDirectionIndex;
         // The highlighted group is already set by the UI, so it's now "locked".
         return true; // Action handled: entered aiming mode.
     }
     // If we reach here, no cannon-specific action was taken. The click might be a move.
     return false;
 }
+
 /**
- * Handles the logic for when a unit is already selected and a hex is clicked.
+ * Handles a click when a unit is already selected. This function determines
+ * whether the click corresponds to a valid move, a re-selection of another
+ * friendly unit, or an invalid action that should deselect the unit.
  * @param {number} clickedIndex - The index of the hex that was clicked.
  */
 function handleMoveUnit(clickedIndex) {
     const selectedHex = hexagon[gameState.selected];
 
-    // --- Cannon Action Logic ---
-    if (selectedHex.unit === 4) {
-        // Delegate to the helper. If it handles the action (returns true), we're done.
-        if (_handleCannonAction(clickedIndex)) {
-            return;
-        }
-    }
-    // --- Standard Click Logic (requires clicking ON a hex) ---
-    // If we reach here, it means the cannon didn't set a threat or aim.
-    // All subsequent logic requires a valid hex click.
-    if (clickedIndex === -1) {
-        if (sounds.error) sounds.error.play();
-        gameState.badClick = 3; // "Can't go there"
-        return;
-    }
-
-    const clickedHex = hexagon[clickedIndex];
-
+    // If the player clicks the already-selected unit, deselect it.
+    // This provides a consistent way to cancel an action.
     if (clickedIndex === gameState.selected) {
-        gameState.selected = -1; // Deselect by clicking the same unit
+        if (sounds.select) sounds.select.play();
+        gameState.selected = -1;
         gameState.validMoves.clear();
         gameState.potentialCannonTargets = [];
-        gameState.badClick = 0;
-        return;
+        gameState.highlightedCannonTargetGroup = null;
+        gameState.cannonIsAiming = false;
+        gameState.lockedAimingDirectionIndex = null;
+        gameState.badClick = 0; // Clear any previous error messages
+        return; // Action is complete.
     }
 
-    if (gameState.validMoves.has(clickedIndex)) {
-        // Move to a valid hex
+    // 1. Check for a valid move to an empty hex. This has the highest priority.
+    if (clickedIndex !== -1 && gameState.validMoves.has(clickedIndex)) {
         if (sounds.move) sounds.move.play();
-        gameState.badClick = 0;
-
-        // Record the zone this move originated from.
-        gameState.zonesMovedFromThisTurn.add(selectedHex.zone);
-
+        const sourceHex = hexagon[gameState.selected];
+        const destinationHex = hexagon[clickedIndex];
         // If a cannon that has a threat area moves, the threat must move with it.
-        if (selectedHex.unit === 4 && gameState.cannonThreats.has(gameState.selected)) {
-            // If the cannon also set its threat *this turn*, we need to update that tracking set as well.
-            // This prevents it from setting another threat in the same turn after moving.
-            if (gameState.cannonsFiredThisTurn.has(gameState.selected)) {
-                gameState.cannonsFiredThisTurn.delete(gameState.selected);
-                gameState.cannonsFiredThisTurn.add(clickedIndex);
-            }
-            
-            // Recalculate the threat area from the new position instead of just translating it.
-            // This ensures the threat area correctly reflects edge-of-board limitations.
+        if (sourceHex.unit === 4 && gameState.cannonThreats.has(gameState.selected)) {
             const threatData = gameState.cannonThreats.get(gameState.selected);
-            const relativeAim = threatData.relativeAim;
-
-            // Calculate the new aiming point based on the cannon's new position.
-            const newCannonHex = clickedHex;
-            const newAimingHexX = newCannonHex.xHex + relativeAim.dx;
-            const newAimingHexY = newCannonHex.yHex + relativeAim.dy;
-            const newAimingHexIndex = hexCoordMap.get(`${newAimingHexX},${newAimingHexY}`);
+            const directionIndex = threatData.directionIndex;
 
             // Recalculate the threat area from the new position.
-            const newThreatArea = [];
-            if (newAimingHexIndex !== undefined) {
-                // The cannon's new firing ring.
-                const hexesAtRange1 = getHexesInRange(clickedIndex, 1);
-                const hexesAtRange2 = getHexesInRange(clickedIndex, 2);
-                const ringSet = new Set(hexesAtRange2.filter(h => !hexesAtRange1.includes(h)));
-
-                // The new aiming hex and its neighbors.
-                const aimingHex = hexagon[newAimingHexIndex];
-                const potentialBlastArea = [newAimingHexIndex, ...aimingHex.adjacencies];
-
-                // The new threat area is the intersection of the blast area and the new firing ring.
-                for (const hexIndex of potentialBlastArea) {
-                    if (ringSet.has(hexIndex)) {
-                        newThreatArea.push(hexIndex);
-                    }
-                }
-            }
+            const newThreatArea = _calculateCannonTargetGroupFromDirection(clickedIndex, directionIndex);
 
             // Update the cannonThreats map with the new key (the destination index) and new data.
             gameState.cannonThreats.delete(gameState.selected);
             gameState.cannonThreats.set(clickedIndex, {
                 threatenedHexes: newThreatArea,
-                relativeAim: relativeAim // The relative aim stays the same
+                directionIndex: directionIndex
             });
         }
-
-        // Explicitly move the unit and clear the source hex.
-        clickedHex.unit = selectedHex.unit;
-        clickedHex.team = selectedHex.team;
-        selectedHex.unit = 0;
-        selectedHex.team = 0;
-
+        // Execute the move.
+        gameState.zonesMovedFromThisTurn.add(sourceHex.zone);
+        destinationHex.unit = sourceHex.unit;
+        destinationHex.team = sourceHex.team;
+        sourceHex.unit = 0;
+        sourceHex.team = 0;
         gameState.animateMovementFrom = gameState.selected;
         gameState.animateMovementTo = clickedIndex;
+        // Reset selection state.
         gameState.selected = -1;
         gameState.validMoves.clear();
         gameState.potentialCannonTargets = [];
-
-        // Note: Combat is now handled at the end of the animation,
-        // so we no longer need to call checkZoneControl or calculateAllThreats here.
-
-        // Check if the player has moved from all 7 zones.
-        if (gameState.zonesMovedFromThisTurn.size >= 7) {
-            gameState.endTurn = 1;
-            gameState.badClick = 5; // "No more moves"
-        }
-    } else if (clickedHex.unit !== 0 && clickedHex.team === PLAYER_TEAM) {
-        // Clicked on another friendly unit, so select it instead, if its zone is available.
-        if (gameState.zonesMovedFromThisTurn.has(clickedHex.zone)) {
-            if (sounds.error) sounds.error.play();
-            gameState.badClick = 6; // "Already moved from this zone."
-            return;
-        }
-        gameState.badClick = 0;
-        gameState.selected = clickedIndex;
-        gameState.validMoves = new Set(getValidMovesForUnit(clickedIndex));
-        // If the new unit is a cannon, calculate its targets.
-        if (clickedHex.unit === 4 && !gameState.cannonsFiredThisTurn.has(clickedIndex)) {
-            const hexesAtRange1 = getHexesInRange(clickedIndex, 1);
-            const hexesAtRange2 = getHexesInRange(clickedIndex, 2);
-            gameState.potentialCannonTargets = hexesAtRange2.filter(h => !hexesAtRange1.includes(h));
-        } else {
-            gameState.potentialCannonTargets = [];
-        }
+        gameState.highlightedCannonTargetGroup = null;
+        gameState.cannonIsAiming = false;
+        gameState.lockedAimingDirectionIndex = null;
+    }
+    // 2. If it's not a valid move, check for other actions.
+    else if (selectedHex.unit === 4 && _handleCannonAction(clickedIndex)) {
+        // A cannon-specific action (like aiming) was performed.
+        // The _handleCannonAction function takes care of state changes, so we just return.
+        return;
+    } else if (clickedIndex !== -1 && hexagon[clickedIndex].team === PLAYER_TEAM) {
+        // 3. Clicked on another friendly unit. Reselect it.
+        handleSelectUnit(clickedIndex);
     } else {
+        // 4. Invalid click (empty space, enemy unit, etc.). Deselect the current unit.
         if (sounds.error) sounds.error.play();
         gameState.badClick = 3; // "Can't go there"
+        gameState.selected = -1;
+        gameState.validMoves.clear();
+        gameState.potentialCannonTargets = [];
+        gameState.highlightedCannonTargetGroup = null;
+        gameState.cannonIsAiming = false;
+        gameState.lockedAimingDirectionIndex = null;
     }
 }
 
@@ -3529,6 +3583,33 @@ function handleZoneSelection(clickedIndex) {
         console.log(`Zone ${clickedZone} selected.`);
         // Future logic for zone selection can be added here.
     }
+}
+
+/**
+ * Handles a click on the final "You Win!" screen, specifically for the
+ * rotating "New Game" button.
+ * @returns {boolean} True if the button was clicked and handled, false otherwise.
+ */
+function handleWinScreenClick() {
+    if (!gameState.gameWon || !mainMenuButton) return false;
+
+    // Inverse transform mouse coordinates to check against the button's static position
+    const mx = mouseX - width / 2;
+    const my = mouseY - height / 2;
+    const angle = -gameState.winRotation;
+    const rotatedX = mx * cos(angle) - my * sin(angle);
+    const rotatedY = mx * sin(angle) + my * cos(angle);
+    const finalX = rotatedX + width / 2;
+    const finalY = rotatedY + height / 2;
+
+    // Check if the transformed click is inside the button's original position
+    if (dist(finalX, finalY, mainMenuButton.x, mainMenuButton.y) < (mainMenuButton.radius * 13 / 16)) {
+        gameState = createDefaultGameState();
+        localStorage.removeItem('zoomBftmSaveState');
+        console.log("New game started. Previous save state cleared.");
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -3593,41 +3674,38 @@ function handleBoardClick() {
  */
 function handleDebugButtons() {
     // This function should only be active during development.
-    // For now, we'll just check if the buttons exist.
-    if (!debugSkipLevelButton) return false;
+    // if (debugSkipLevelButton && debugSkipLevelButton.pressed() && gameState.isPlayerTurn) {
+    //     // --- Skip directly to level 5 without animation ---
+    //     console.log("DEBUG: Skipping directly to Level 5.");
+    //     
+    //     // 1. Set the game state for the new level FIRST so that board generation has the correct context.
+    //     gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 5, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
+    //     DIFFICULTY = 4; // Level 5 difficulty is 4
 
-    if (debugSkipLevelButton.pressed() && gameState.isPlayerTurn) {
-        // --- Skip directly to level 5 without animation ---
-        console.log("DEBUG: Skipping directly to Level 5.");
-        
-        // 1. Set the game state for the new level FIRST so that board generation has the correct context.
-        gameState = { ...gameState, selected: -1, badClick: 0, zonesMovedFromThisTurn: new Set(), endTurn: 0, isPlayerTurn: true, aiMoveQueue: [], aiZonesMovedFromThisTurn: new Set(), animationLoop: 0, animateMovementFrom: null, animateMovementTo: null, level: 5, playerTurnCount: 1, secretArcherZone: floor(random(6)) + 1, zoneSelectionMode: false, selectedZone: null, cannonsFiredThisTurn: new Set(), cannonThreats: new Map(), animateCannonThreat: null };
-        DIFFICULTY = 4; // Level 5 difficulty is 4
+    //     // 2. Generate the new board state.
+    //     const newBoard = [];
+    //     for (let i = 0; i < hexagon.length; i++) {
+    //         newBoard[i] = { unit: 0, team: 0 };
+    //     }
 
-        // 2. Generate the new board state.
-        const newBoard = [];
-        for (let i = 0; i < hexagon.length; i++) {
-            newBoard[i] = { unit: 0, team: 0 };
-        }
-
-        // Populate Zone 7 (center)
-        const zone7UnitPool = [ENEMY_TEAM, ENEMY_TEAM, ENEMY_TEAM, PLAYER_TEAM, PLAYER_TEAM, 0, 0];
-        shuffle(zone7UnitPool, true);
-        for (let i = 0; i < ZONE_7_HEX_INDICES.length; i++) {
-            const hexIndex = ZONE_7_HEX_INDICES[i];
-            const team = zone7UnitPool[i];
-            newBoard[hexIndex] = { unit: (team === 0) ? 0 : 1, team: team };
-        }
-        // Populate Outer Zones, passing `null` for the excluded zone since we're creating a full new board.
-        populateNewOuterZones(newBoard, null, gameState.level);
-        // 3. Apply the new board state to the game.
-        for (let i = 0; i < hexagon.length; i++) {
-            hexagon[i].unit = newBoard[i].unit;
-            hexagon[i].team = newBoard[i].team;
-        }
-        if (sounds.boom2) sounds.boom2.play();
-        return true;
-    }
+    //     // Populate Zone 7 (center)
+    //     const zone7UnitPool = [ENEMY_TEAM, ENEMY_TEAM, ENEMY_TEAM, PLAYER_TEAM, PLAYER_TEAM, 0, 0];
+    //     shuffle(zone7UnitPool, true);
+    //     for (let i = 0; i < ZONE_7_HEX_INDICES.length; i++) {
+    //         const hexIndex = ZONE_7_HEX_INDICES[i];
+    //         const team = zone7UnitPool[i];
+    //         newBoard[hexIndex] = { unit: (team === 0) ? 0 : 1, team: team };
+    //     }
+    //     // Populate Outer Zones, passing `null` for the excluded zone since we're creating a full new board.
+    //     populateNewOuterZones(newBoard, null, gameState.level);
+    //     // 3. Apply the new board state to the game.
+    //     for (let i = 0; i < hexagon.length; i++) {
+    //         hexagon[i].unit = newBoard[i].unit;
+    //         hexagon[i].team = newBoard[i].team;
+    //     }
+    //     if (sounds.boom2) sounds.boom2.play();
+    //     return true;
+    // }
 
     return false;
 }
@@ -3737,9 +3815,14 @@ function mouseClicked() {
     // It's safe to call this multiple times.
     userStartAudio();
 
-    // Block all input if the game has been won.
-    // Also block input during the zoom-out level transition.
-    if (gameState.gameWon || zoomInAnimationState.phase !== 'inactive' || zoomOutAnimationState.phase !== 'inactive') {
+    // If the game is won, only check for the win screen button click and then stop.
+    if (gameState.gameWon) {
+        handleWinScreenClick();
+        return;
+    }
+
+    // Block input during level transitions.
+    if (zoomInAnimationState.phase !== 'inactive' || zoomOutAnimationState.phase !== 'inactive') {
         return;
     }
 
