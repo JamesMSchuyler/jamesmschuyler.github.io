@@ -52,6 +52,22 @@ const AI_SCORING_WEIGHTS = {
     TARGET_GROUP_SIZE_BONUS: 10 // Bonus per hex in the target area.
 };
 
+/**
+ * Defines the "point value" of each unit. This is used to calculate a team's
+ * total strength in a zone for determining unit promotions on level-up.
+ */
+const UNIT_VALUES = {
+    1: 1,   // Soldier
+    2: 3,   // Archer
+    3: 1.5, // Cavalry
+    4: 2    // Cannon
+};
+
+/**
+ * Defines a strength hierarchy for unit types, used to ensure that a unit
+ * promotion never results in a weaker unit.
+ */
+const UNIT_STRENGTH_RANK = { 1: 1, 3: 2, 4: 3, 2: 4 }; // Soldier < Cavalry < Cannon < Archer
 
 /**
  * Defines the rules for promoting a standard soldier to a special unit type
@@ -60,10 +76,10 @@ const AI_SCORING_WEIGHTS = {
  */
 const SPECIAL_UNIT_PROMOTION_RULES = [
     // Rules should be ordered by priority (strongest unit first)
-    { unitType: 2, advantage: 6, minLevel: 4 }, // Archer
-    { unitType: 4, advantage: 4, minLevel: 6 }, // Cannon
+    { unitType: 2, pointAdvantage: 6, minLevel: 4 }, // Archer
+    { unitType: 4, pointAdvantage: 4, minLevel: 6 }, // Cannon
     // Cavalry can be created on level 3 or higher.
-    { unitType: 3, advantage: 3, minLevel: 3 } // Cavalry
+    { unitType: 3, pointAdvantage: 3, minLevel: 3 } // Cavalry
 ];
 
 // Layout for the 7 dots in a hexagonal cluster for the "Moves Left" UI.
@@ -945,14 +961,14 @@ function drawCannonTargetingUI() {
 const STATUS_MESSAGES = {
     1: { size: 20, lines: ["Click on Unit"], x: 120, y: -130 },
     2: { size: 20, lines: ["Move to Open Hex"], x: 115, y: -130 },
-    3: { size: 20, lines: ["Can't go there"], x: 120, y: -130 },
-    4: { size: 20, lines: ["Click on your", "own units,", "dude!"], x: [128, 143, 158], y: [-143, -122, -101] },
+    3: { size: 20, lines: ["Can't go there"], x: 164, y: -130 },
+    4: { size: 20, lines: ["Click on your", "own units,", "dude!"], x: [150, 165, 180], y: [-143, -122, -101] },
     5: { size: 20, lines: ["No more moves.", "Click 'End Turn'"], x: [115, 125], y: [-138, -117] },
-    6: { size: 20, lines: ["Already moved", "from this zone."], x: [115, 125], y: [-138, -117] },
+    6: { size: 20, lines: ["Already moved", "from this zone."], x: [159, 169], y: [-138, -117] },
     7: { size: 20, lines: ["Click 'Zoom In' to", "confirm. Deselect", "zone to exit."], x: [115, 125, 135], y: [-138, -117, -96] },
     // Consolidated messages
     8: { size: 20, lines: ["Select zone", "to Zoom in"], x: [115, 125], y: [-138, -117] },
-    9: { size: 20, lines: ["Where to?"], x: 130, y: -130 },
+    9: { size: 20, lines: ["Where to?"], x: 152, y: -130 },
     10: { size: 20, lines: ["Select target", "hexes"], x: [115, 125], y: [-138, -117] },
     11: { size: 20, lines: ["Move or Select", "target hexes"], x: [115, 125], y: [-138, -117] },
     12: { size: 20, lines: ["Tap again to confirm", "or aim elsewhere"], x: [115, 125], y: [-138, -117] },
@@ -1372,31 +1388,29 @@ function checkZoneControl(zone, team) {
 /**
  * @private
  * Determines the type of unit that will be created on the next level based on zone dominance.
- * This function is data-driven, using the `SPECIAL_UNIT_PROMOTION_RULES` constant to make
- * the logic for unit promotion a single, extensible source of truth.
- * @param {number} advantage - The unit advantage (e.g., player units - enemy units).
- * @param {Set<number>} presentSpecialUnits - A set of special unit types already in the zone.
+ * It uses a point-based system and also ensures that an existing special unit can carry itself over.
+ * @param {number} pointAdvantage - The point value advantage (e.g., player points - enemy points).
+ * @param {number} bestPresentUnit - The unit type of the strongest unit already in the zone.
  * @param {number} nextLevel - The level number that the unit will be carried over TO.
  * @returns {number} The unit type (1: Soldier, 2: Archer, 3: Cavalry, 4: Cannon).
  */
-function _getCarryoverUnitType(advantage, presentSpecialUnits, nextLevel) {
+function _getCarryoverUnitType(pointAdvantage, bestPresentUnit, nextLevel) {
+    let promotedByPoints = 1; // Default to Soldier
+
+    // Determine the best possible unit based on point advantage and level requirements.
     for (const rule of SPECIAL_UNIT_PROMOTION_RULES) {
-        const hasUnit = presentSpecialUnits.has(rule.unitType);
-
-        // Check for creation via advantage
-        const canCreateByAdvantage = advantage >= rule.advantage;
-
-        // Check level requirements for creation
-        let levelRequirementMet = nextLevel >= rule.minLevel;
-        if (rule.specialLevelCheck) {
-            levelRequirementMet = levelRequirementMet || rule.specialLevelCheck();
-        }
-
-        if (hasUnit || (canCreateByAdvantage && levelRequirementMet)) {
-            return rule.unitType;
+        if (pointAdvantage >= rule.pointAdvantage && nextLevel >= rule.minLevel) {
+            promotedByPoints = rule.unitType;
+            break; // Rules are ordered by priority, so we take the first one we qualify for.
         }
     }
-    return 1; // Default to Soldier
+
+    // The final unit must be at least as strong as the best unit already present.
+    // This handles both the "carryover" and "never downgrade" rules.
+    if (UNIT_STRENGTH_RANK[bestPresentUnit] > UNIT_STRENGTH_RANK[promotedByPoints]) {
+        return bestPresentUnit;
+    }
+    return promotedByPoints;
 }
 
 /**
@@ -1416,16 +1430,33 @@ function calculateZoneDominance() { // Simplified archer logic
         const playerUnitCount = playerUnitsInZone.length;
         const enemyUnitCount = enemyUnitsInZone.length;
 
-        const playerAdvantage = playerUnitCount - enemyUnitCount;
-        const enemyAdvantage = enemyUnitCount - playerUnitCount;
+        const unitAdvantage = playerUnitCount - enemyUnitCount;
 
-        if (playerAdvantage >= 2) {
-            const presentSpecialUnits = new Set(playerUnitsInZone.filter(u => u.unit > 1).map(u => u.unit));
-            const unitType = _getCarryoverUnitType(playerAdvantage, presentSpecialUnits, gameState.level + 1);
+        if (unitAdvantage >= 2) { // Player has dominance
+            const playerPointValue = playerUnitsInZone.reduce((sum, u) => sum + (UNIT_VALUES[u.unit] || 1), 0);
+            const enemyPointValue = enemyUnitsInZone.reduce((sum, u) => sum + (UNIT_VALUES[u.unit] || 1), 0);
+            const pointAdvantage = playerPointValue - enemyPointValue;
+
+            let bestPresentUnit = 1;
+            if (playerUnitsInZone.length > 0) {
+                const bestUnitObject = playerUnitsInZone.reduce((best, current) => {
+                    return (UNIT_STRENGTH_RANK[current.unit] || 1) > (UNIT_STRENGTH_RANK[best.unit] || 1) ? current : best;
+                });
+                bestPresentUnit = bestUnitObject.unit;
+            }
+
+            const unitType = _getCarryoverUnitType(pointAdvantage, bestPresentUnit, gameState.level + 1);
             zoneDominance[zone] = { team: PLAYER_TEAM, unitType: unitType };
-        } else if (enemyAdvantage >= 2) {
-            const presentSpecialUnits = new Set(enemyUnitsInZone.filter(u => u.unit > 1).map(u => u.unit));
-            const unitType = _getCarryoverUnitType(enemyAdvantage, presentSpecialUnits, gameState.level + 1);
+        } else if (unitAdvantage <= -2) { // Enemy has dominance
+            const playerPointValue = playerUnitsInZone.reduce((sum, u) => sum + (UNIT_VALUES[u.unit] || 1), 0);
+            const enemyPointValue = enemyUnitsInZone.reduce((sum, u) => sum + (UNIT_VALUES[u.unit] || 1), 0);
+            const pointAdvantage = enemyPointValue - playerPointValue;
+
+            const bestPresentUnit = enemyUnitsInZone.length > 0 ?
+                enemyUnitsInZone.reduce((best, current) => (UNIT_STRENGTH_RANK[current.unit] || 1) > (UNIT_STRENGTH_RANK[best.unit] || 1) ? current : best).unit :
+                1;
+
+            const unitType = _getCarryoverUnitType(pointAdvantage, bestPresentUnit, gameState.level + 1);
             zoneDominance[zone] = { team: ENEMY_TEAM, unitType: unitType };
         } else {
             // No team has dominance.
