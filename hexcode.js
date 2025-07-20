@@ -74,13 +74,19 @@ const UNIT_STRENGTH_RANK = { 1: 1, 3: 2, 4: 3, 2: 4 }; // Soldier < Cavalry < Ca
  * when a zone is captured at the end of a level. The rules are ordered by priority,
  * with the strongest or most specific units appearing first.
  */
+/**
+ * Defines the rules for promoting a standard soldier to a special unit type
+ * when a zone is captured at the end of a level. The rules are ordered by priority,
+ * with the strongest or most specific units appearing first.
+ */
 const SPECIAL_UNIT_PROMOTION_RULES = [
     // Rules should be ordered by priority (strongest unit first)
-    { unitType: 2, pointAdvantage: 6, minLevel: 4 }, // Archer
-    { unitType: 4, pointAdvantage: 4, minLevel: 6 }, // Cannon
-    // Cavalry can be created on level 3 or higher.
-    { unitType: 3, pointAdvantage: 3, minLevel: 3 } // Cavalry
+    { unitType: 2, pointAdvantage: 6, unlockFlag: 'hasBeenOnLevel3' }, // Archer
+    { unitType: 4, pointAdvantage: 4, unlockFlag: 'hasBeenOnLevel5' }, // Cannon
+    // Cavalry are unlocked after the player has been on level 2.
+    { unitType: 3, pointAdvantage: 3, unlockFlag: 'hasBeenOnLevel2' }  // Cavalry
 ];
+
 
 // Layout for the 7 dots in a hexagonal cluster for the "Moves Left" UI.
 // Defined globally with normalized coordinates (0 to 1) as it's a constant
@@ -1399,7 +1405,8 @@ function _getCarryoverUnitType(pointAdvantage, bestPresentUnit, nextLevel) {
 
     // Determine the best possible unit based on point advantage and level requirements.
     for (const rule of SPECIAL_UNIT_PROMOTION_RULES) {
-        if (pointAdvantage >= rule.pointAdvantage && nextLevel >= rule.minLevel) {
+ // Check if the player has unlocked this unit type by reaching the required level.
+        if (pointAdvantage >= rule.pointAdvantage && gameState[rule.unlockFlag]) {
             promotedByPoints = rule.unitType;
             break; // Rules are ordered by priority, so we take the first one we qualify for.
         }
@@ -1509,41 +1516,52 @@ function getWeightedRandom(options) {
     return options[options.length - 1].value; // Fallback
 }
 
+/**
+ * Defines the possible unit compositions when "zooming in" on a hex.
+ * The outcomes are based on the unit type being zoomed into, providing a
+ * point-based advantage to the owner of that unit.
+ */
+/**
+ * Defines the possible unit compositions when "zooming in" on a hex.
+ * The outcomes are based on the unit type being zoomed into, providing a
+ * point-based advantage to the owner of that unit.
+ */
 const ZOOM_IN_UNIT_CONFIG = {
-    2: { // Archer: +4.5 advantage
-        minLevel: 3,
-        playerOptions: [
-            { value: [5, 1], weight: 4 }, { value: [6, 1], weight: 3 },
-            { value: [4, 0], weight: 2 }, { value: [6, 0], weight: 1 }
-        ],
-        enemyOptions: [
-            { value: [1, 5], weight: 4 }, { value: [1, 6], weight: 3 },
-            { value: [0, 4], weight: 2 }, { value: [0, 6], weight: 1 }
+    // Archer (value: 3) -> Results in a point advantage of ~2.5-4
+    2: {
+        options: [
+            // Soldier-heavy outcome
+            { value: { player: { soldiers: 5 }, enemy: { soldiers: 1 } }, weight: 4 },
+            // Mixed force with cavalry
+            { value: { player: { soldiers: 2, cavalry: 1 }, enemy: { soldiers: 1 } }, weight: 3, unlockFlag: 'hasBeenOnLevel2' },
+            // Direct carryover of the archer
+            { value: { player: { archers: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 },
+            // Mixed force with a cannon, only available on higher levels
+            { value: { player: { cannons: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 2, unlockFlag: 'hasBeenOnLevel5' }
         ]
     },
-    3: { // Cavalry: +2.2 advantage
-        minLevel: 2,
-        playerOptions: [
-            { value: [4, 2], weight: 4 }, { value: [3, 1], weight: 3 },
-            { value: [5, 2], weight: 2 }, { value: [2, 0], weight: 1 }
-        ],
-        enemyOptions: [
-            { value: [2, 4], weight: 4 }, { value: [1, 3], weight: 3 },
-            { value: [2, 5], weight: 2 }, { value: [0, 2], weight: 1 }
+    // Cavalry (value: 1.5) -> Results in a point advantage of ~1.5-2
+    3: {
+        options: [
+            // Soldier-heavy outcome
+            { value: { player: { soldiers: 3 }, enemy: { soldiers: 1 } }, weight: 4 },
+            // Direct carryover of the cavalry
+            { value: { player: { cavalry: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 }
         ]
     },
-    4: { // Cannon: +3.1 advantage
-        minLevel: 5,
-        playerOptions: [
-            { value: [4, 1], weight: 4 }, { value: [5, 2], weight: 3 },
-            { value: [3, 0], weight: 2 }, { value: [4, 0], weight: 1 }
-        ],
-        enemyOptions: [
-            { value: [1, 4], weight: 4 }, { value: [2, 5], weight: 3 },
-            { value: [0, 3], weight: 2 }, { value: [0, 4], weight: 1 }
+    // Cannon (value: 2) -> Results in a point advantage of ~2-3
+    4: {
+        options: [
+            // Soldier-heavy outcome
+            { value: { player: { soldiers: 4 }, enemy: { soldiers: 1 } }, weight: 4 },
+            // Mixed force with cavalry, available on most levels
+            { value: { player: { soldiers: 2, cavalry: 1 }, enemy: { soldiers: 1 } }, weight: 3, unlockFlag: 'hasBeenOnLevel2' },
+            // Direct carryover of the cannon
+            { value: { player: { cannons: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 }
         ]
     }
 };
+
 
 /**
  * Generates the board state for a new, lower level by "zooming in" on a
@@ -1563,20 +1581,24 @@ function generateZoomInBoard(sourceZone) {
 
     // For Soldier hexes (reflects a +2 advantage, penalized to ~+1)
     const playerSoldierOptions = [
-        { value: [3, 2], weight: 4 }, { value: [2, 1], weight: 3 },
-        { value: [4, 2], weight: 2 }, { value: [1, 0], weight: 1 }
+        { value: { player: { soldiers: 3 }, enemy: { soldiers: 2 } }, weight: 4 },
+        { value: { player: { soldiers: 2 }, enemy: { soldiers: 1 } }, weight: 3 },
+        { value: { player: { soldiers: 4 }, enemy: { soldiers: 2 } }, weight: 2 },
+        { value: { player: { soldiers: 1 }, enemy: { soldiers: 0 } }, weight: 1 }
     ];
     const enemySoldierOptions = [
-        { value: [2, 3], weight: 4 }, { value: [1, 2], weight: 3 },
-        { value: [2, 4], weight: 2 }, { value: [0, 1], weight: 1 }
+        { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
+        { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 3 },
+        { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
+        { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
     ];
 
     // For Neutral hexes (slight enemy advantage, as per original design)
     const neutralOptions = [
-        { value: [2, 3], weight: 4 }, // 5 units, enemy advantage
-        { value: [1, 2], weight: 2 }, // 3 units, enemy advantage
-        { value: [2, 4], weight: 2 }, // 6 units, enemy advantage
-        { value: [0, 1], weight: 1 }  // 1 unit, enemy advantage
+        { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
+        { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 2 },
+        { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
+        { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
     ];
 
     // 1. Find the center and outer hexes of the source zone.
@@ -1617,61 +1639,53 @@ function generateZoomInBoard(sourceZone) {
     for (const [sourceHex, newZoneNum] of sourceHexToNewZoneMap.entries()) {
         const hexesInNewZone = hexagon.map((h, i) => ({...h, index: i})).filter(h => h.zone === newZoneNum).map(h => h.index);
 
-        let unitCounts, specialUnitToCarryOver = 0;
+        let finalPackage;
         const unitConfig = ZOOM_IN_UNIT_CONFIG[sourceHex.unit];
 
-        if (sourceHex.team === PLAYER_TEAM) {
-            if (unitConfig) { // It's a special unit
-                if (random() < 0.5) { // 50% chance for direct carryover
-                    unitCounts = getWeightedRandom(playerSoldierOptions);
-                    specialUnitToCarryOver = sourceHex.unit;
-                } else { // 50% chance for soldier advantage
-                    unitCounts = getWeightedRandom(unitConfig.playerOptions);
+        if (unitConfig) { // It's a special unit
+            const validOptions = unitConfig.options.filter(opt => !opt.unlockFlag || gameState[opt.unlockFlag]);
+            const basePackage = getWeightedRandom(validOptions);
+
+            if (sourceHex.team === PLAYER_TEAM) {
+                finalPackage = basePackage;
+            } else { // It's an AI special unit
+                // Swap the player and enemy packages...
+                finalPackage = { player: basePackage.enemy, enemy: basePackage.player };
+                // ...and add the AI difficulty bonus of 2 soldiers.
+                if (!finalPackage.enemy.soldiers) {
+                    finalPackage.enemy.soldiers = 0;
                 }
-            } else { // It's a soldier
-                unitCounts = getWeightedRandom(playerSoldierOptions);
+                finalPackage.enemy.soldiers += 2;
             }
-        } else if (sourceHex.team === ENEMY_TEAM) {
-            if (unitConfig) { // It's a special unit
-                if (random() < 0.5) { // 50% chance for direct carryover
-                    unitCounts = getWeightedRandom(enemySoldierOptions);
-                    specialUnitToCarryOver = sourceHex.unit;
-                } else { // 50% chance for soldier advantage
-                    unitCounts = getWeightedRandom(unitConfig.enemyOptions);
-                }
-            } else { // It's a soldier
-                unitCounts = getWeightedRandom(enemySoldierOptions);
-            }
-        } else { // Neutral
-            unitCounts = getWeightedRandom(neutralOptions);
+        } else if (sourceHex.unit === 1) { // It's a soldier
+           // Filter options based on whether the special unit has been unlocked.
+            // For soldiers, the options are pre-defined for each team, so no swap is needed.
+            finalPackage = getWeightedRandom(sourceHex.team === PLAYER_TEAM ? playerSoldierOptions : enemySoldierOptions);
+        } else { // It's a neutral hex
+            // Neutral hexes also have a pre-defined package.
+            finalPackage = getWeightedRandom(neutralOptions);
         }
 
-        const playerUnits = unitCounts[0];
-        const enemyUnits = unitCounts[1];
-
+        // Create a pool of units based on the chosen package.
         const unitPool = [];
-        for (let i = 0; i < playerUnits; i++) unitPool.push({ unit: 1, team: PLAYER_TEAM });
-        for (let i = 0; i < enemyUnits; i++) unitPool.push({ unit: 1, team: ENEMY_TEAM });
+        const addUnitsToPool = (team, package) => {
+            for (let i = 0; i < (package.soldiers || 0); i++) unitPool.push({ unit: 1, team: team });
+            for (let i = 0; i < (package.archers || 0); i++) unitPool.push({ unit: 2, team: team });
+            for (let i = 0; i < (package.cavalry || 0); i++) unitPool.push({ unit: 3, team: team });
+            for (let i = 0; i < (package.cannons || 0); i++) unitPool.push({ unit: 4, team: team });
+        };
+
+        addUnitsToPool(PLAYER_TEAM, finalPackage.player);
+        addUnitsToPool(ENEMY_TEAM, finalPackage.enemy);
+
+        // Fill the rest of the zone with empty hexes.
         while (unitPool.length < hexesInNewZone.length) unitPool.push({ unit: 0, team: 0 });
 
         shuffle(unitPool, true);
 
+        // Place the units on the board.
         for (let i = 0; i < hexesInNewZone.length; i++) {
             boardState[hexesInNewZone[i]] = unitPool[i];
-        }
-
-        // If a special unit is being carried over, convert one of the new soldiers.
-        if (specialUnitToCarryOver > 0) {
-            const carryoverConfig = ZOOM_IN_UNIT_CONFIG[specialUnitToCarryOver];
-            if (gameState.level - 1 >= carryoverConfig.minLevel) {
-                const potentialHexes = hexesInNewZone.filter(i =>
-                    boardState[i].team === sourceHex.team && boardState[i].unit === 1
-                );
-                if (potentialHexes.length > 0) {
-                    const hexToConvert = random(potentialHexes);
-                    if (hexToConvert) boardState[hexToConvert].unit = specialUnitToCarryOver;
-                }
-            }
         }
     }
 
@@ -2295,13 +2309,15 @@ function populateNewOuterZones(board, excludedZone, levelToGenerate) {
     for (const [hexIndex, state] of outerZonePlacements.entries()) {
         board[hexIndex] = { unit: state.unit, team: state.team };
     }
-    if (levelToGenerate >= 3) {
+   // Seed the AI with special units based on what the player has unlocked,
+    // making the board composition dependent on the player's progress.
+    if (gameState.hasBeenOnLevel3) {
         _convertRandomSoldier(board, ENEMY_TEAM, 2, 'archer', excludedZone);
     }
-    if (levelToGenerate >= 2) {
+  if (gameState.hasBeenOnLevel2) {
         _convertRandomSoldier(board, ENEMY_TEAM, 3, 'cavalry', excludedZone);
     }
-    if (levelToGenerate >= 5) {
+    if (gameState.hasBeenOnLevel5) {
         _convertRandomSoldier(board, ENEMY_TEAM, 4, 'cannon', excludedZone);
     }
 }
