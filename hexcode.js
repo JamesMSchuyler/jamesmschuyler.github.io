@@ -6,7 +6,7 @@ const ENEMY_TEAM = 2;
 const hexSize = 25;
 let DIFFICULTY = -1; // Initialized at -1, +1 per level. 0=9/9 dice, 1=9/10, 2=8/10, etc.
 const r = hexSize; // "radius"
-const animationLoopSize = 53;
+let animationLoopSize = 53;
 let boardScale; // This will now be calculated dynamically to be responsive
 
 const LEVEL_NAMES = [
@@ -33,6 +33,13 @@ const DIFFICULTY_LABELS = {
     "9": "Impossible",
     "10": "Very Impossible"
 };
+
+const ANIMATION_SPEED_CONFIG = [
+    { label: "Normal", secondLabel: "Animation", multiplier: 1.0 },
+    { label: "Fast", secondLabel: "Animation", multiplier: 0.5 },
+    { label: "Very Fast", secondLabel: "Animation", multiplier: 0.25 },
+    { label: "Slow", secondLabel: "Animation", multiplier: 2.0 }
+];
 
 const AI_SCORING_WEIGHTS = {
     RANDOM_TIEBREAK: 45,
@@ -102,6 +109,13 @@ let hexesByZone = new Map(); // Cache for quick lookups of hexes by zone
 let hexRangeCache = new Map(); // Cache for pre-calculated hex ranges to improve performance
 let hexCoordMap = new Map(); // Cache for mapping "x,y" coordinates to a hex index
 let hexagon = [];
+let optionsNewGameButton;
+let optionsBackButton;
+let volumeControl;
+let movementAnimationControl;
+let zoomAnimationControl;
+let difficultyControl;
+let audioInitialized = false;
 
 /**
  * Creates and returns a new, default gameState object.
@@ -144,6 +158,9 @@ function createDefaultGameState() {
         cannonsThatTargetedThisTurn: new Set(),
         selectedZone: null,
         zoneSelectionMode: false,
+        movementAnimationSpeedSetting: 0, // 0: Normal, 1: Fast, 2: Very Fast, 3: Slow
+        zoomAnimationSpeedSetting: 0, // 0: Normal, 1: Fast, 2: Very Fast, 3: Slow
+        masterVolume: 10, // On a scale of 0-10
     };
 }
 let gameState = createDefaultGameState();
@@ -175,27 +192,24 @@ function hexToXY(xHexA, yHexA)   {
     };
 };
 
-function clickIsInCircle(xHexB, yHexB)  {
-    // The main draw loop is translated to the center of the screen.
-    // We must adjust the global mouse coordinates to be in that same coordinate space,
-    // and we must also account for the board being scaled up.
-    const translatedMouseX = mouseX - (width / 2);
-    const translatedMouseY = mouseY - (height / 2);
-
-    const scaledMouseX = translatedMouseX / boardScale;
-    const scaledMouseY = translatedMouseY / boardScale;
-
-    const hexPos = hexToXY(xHexB, yHexB); // hexToXY returns the hex's position relative to the center.
-
-    return  (scaledMouseX - hexPos.x) * (scaledMouseX - hexPos.x) +
-            (scaledMouseY - hexPos.y) * (scaledMouseY - hexPos.y) <
-            (r * 13 / 16) * (r * 13 / 16);
+/**
+ * @private
+ * Checks if a given point is within the clickable circle of a hex.
+ * This is a helper for findClickedHex, which pre-calculates the scaled mouse coordinates.
+ * @param {number} scaledMouseX - The pre-scaled and translated X coordinate of the mouse.
+ * @param {number} scaledMouseY - The pre-scaled and translated Y coordinate of the mouse.
+ * @param {Hexagon} hex - The hexagon object to check against.
+ * @returns {boolean} True if the point is inside the circle.
+ */
+function _isClickInCircle(scaledMouseX, scaledMouseY, hex) {
+    const hexPos = hexToXY(hex.xHex, hex.yHex);
+    return (scaledMouseX - hexPos.x) ** 2 + (scaledMouseY - hexPos.y) ** 2 < (r * 13 / 16) ** 2;
 }
 
 let zoneColor = [];
 
 class Button {
-    constructor(x, y, radius, label, secondLabel, arrowStyle = 'none', shape = 'circle') {
+    constructor(x, y, radius, label, secondLabel, arrowStyle = 'none', shape = 'circle', widthMultiplier = 1) {
         this.x = x; // Absolute canvas coordinates
         this.y = y; // Absolute canvas coordinates
         this.radius = radius; // For circles: radius. For rectangles: half-width.
@@ -203,6 +217,7 @@ class Button {
         this.secondLabel = secondLabel;
         this.arrowStyle = arrowStyle;
         this.shape = shape;
+        this.widthMultiplier = widthMultiplier;
     }
 
     draw(isActive = true, isToggled = false) {
@@ -230,8 +245,9 @@ class Button {
         }
 
         if (this.shape === 'rectangle') {
-            const rectWidth = this.radius * (13 / 16) * 2;
-            const rectHeight = rectWidth * 0.6;
+            const baseWidth = this.radius * (13 / 16) * 2;
+            const rectWidth = baseWidth * this.widthMultiplier;
+            const rectHeight = baseWidth * 0.6;
             rectMode(CENTER);
             rect(drawX, drawY, rectWidth, rectHeight, 10); // Use a corner radius
             rectMode(CORNER); // Reset
@@ -307,8 +323,9 @@ class Button {
 
     pressed() {
         if (this.shape === 'rectangle') {
-            const rectWidth = this.radius * (13 / 16) * 2;
-            const rectHeight = rectWidth * 0.6;
+            const baseWidth = this.radius * (13 / 16) * 2;
+            const rectWidth = baseWidth * this.widthMultiplier;
+            const rectHeight = baseWidth * 0.6;
             const halfWidth = rectWidth / 2;
             const halfHeight = rectHeight / 2;
             return (mouseX > this.x - halfWidth && mouseX < this.x + halfWidth &&
@@ -318,6 +335,136 @@ class Button {
             return dist(mouseX, mouseY, this.x, this.y) < (this.radius * 13 / 16);
         }
     }
+}
+
+class OptionControl {
+    constructor(label, centerX, centerY, valueGetter, valueSetter) {
+        this.label = label;
+        this.centerX = centerX;
+        this.centerY = centerY;
+        this.valueGetter = valueGetter;
+        this.valueSetter = valueSetter;
+
+        // Create the up and down arrow buttons for this control
+        const buttonRadius = 20 * boardScale;
+        const baseWidth = buttonRadius * (13 / 16) * 2;
+        const buttonHeight = baseWidth * 0.6;
+        const verticalOffset = buttonHeight * 0.6;
+
+        this.upArrowButton = new Button(this.centerX, this.centerY - verticalOffset, buttonRadius, "", null, 'none', 'rectangle');
+        this.downArrowButton = new Button(this.centerX, this.centerY + verticalOffset, buttonRadius, "", null, 'none', 'rectangle');
+    }
+
+    _drawChevron(centerX, centerY, size, direction) {
+        const halfSize = size / 2;
+        if (direction === 'up') {
+            line(centerX - size, centerY + halfSize, centerX, centerY - halfSize);
+            line(centerX, centerY - halfSize, centerX + size, centerY + halfSize);
+        } else { // 'down'
+            line(centerX - size, centerY - halfSize, centerX, centerY + halfSize);
+            line(centerX, centerY + halfSize, centerX + size, centerY - halfSize);
+        }
+    }
+
+    draw() {
+        // 1. Draw the button bodies
+        this.upArrowButton.draw(true);
+        this.downArrowButton.draw(true);
+
+        // 2. Draw the chevrons inside the buttons
+        const arrowSize = 6 * boardScale;
+        const arrowColor = color(50);
+        stroke(arrowColor);
+        strokeWeight(2.5 * boardScale);
+        noFill();
+
+        this._drawChevron(this.upArrowButton.x - (width / 2), this.upArrowButton.y - (height / 2), arrowSize, 'up');
+        this._drawChevron(this.downArrowButton.x - (width / 2), this.downArrowButton.y - (height / 2), arrowSize, 'down');
+
+        // 3. Draw the text label and value
+        noStroke();
+        fill(0);
+        textSize(22 * boardScale);
+
+        const buttonStackCenterX = this.centerX - (width / 2);
+        const buttonStackWidth = (this.upArrowButton.radius * (13 / 16) * 2) * this.upArrowButton.widthMultiplier;
+        const textPadding = 10 * boardScale;
+        const textCenterY = this.centerY - (height / 2);
+
+        textAlign(RIGHT, CENTER);
+        text(this.label, buttonStackCenterX - buttonStackWidth / 2 - textPadding, textCenterY);
+
+        textAlign(LEFT, CENTER);
+        text(this.valueGetter(), buttonStackCenterX + buttonStackWidth / 2 + textPadding, textCenterY);
+    }
+
+    handleClicks() {
+        if (this.upArrowButton.pressed()) {
+            this.valueSetter('up');
+            if (sounds.select) sounds.select.play();
+            return true;
+        }
+        if (this.downArrowButton.pressed()) {
+            this.valueSetter('down');
+            if (sounds.select) sounds.select.play();
+            return true;
+        }
+        return false;
+    }
+}
+
+/**
+ * Gets the animation speed multiplier based on the current user setting.
+ * @returns {number} The multiplier (e.g., 1.0 for normal, 0.5 for fast).
+ */
+function getMovementAnimationSpeedMultiplier() {
+    if (ANIMATION_SPEED_CONFIG[gameState.movementAnimationSpeedSetting]) {
+        return ANIMATION_SPEED_CONFIG[gameState.movementAnimationSpeedSetting].multiplier;
+    }
+    return 1.0; // Default to normal speed if setting is invalid
+}
+
+/**
+ * Gets the zoom animation speed multiplier based on the current user setting.
+ * @returns {number} The multiplier (e.g., 1.0 for normal, 0.5 for fast).
+ */
+function getZoomAnimationSpeedMultiplier() {
+    if (ANIMATION_SPEED_CONFIG[gameState.zoomAnimationSpeedSetting]) {
+        return ANIMATION_SPEED_CONFIG[gameState.zoomAnimationSpeedSetting].multiplier;
+    }
+    return 1.0; // Default to normal speed if setting is invalid
+}
+
+/**
+ * Updates the global animation speed variables based on the current setting.
+ * This should be called whenever the setting changes or a game is loaded.
+ */
+function updateAnimationSpeed() {
+    const multiplier = getMovementAnimationSpeedMultiplier();
+    animationLoopSize = 53 * multiplier;
+}
+
+/**
+ * Updates the p5.js master volume based on the current game setting.
+ * This should be called whenever the setting changes or a game is loaded.
+ */
+function updateMasterVolume() {
+    // Don't try to set volume if the sound library isn't ready.
+    // We can check for one of the sound objects to exist as a proxy.
+    if (!sounds.select) {
+        return;
+    }
+    const volumeLevel = constrain(gameState.masterVolume, 0, 10);
+    const p5Volume = volumeLevel / 10.0;
+
+    // Set volume individually for each sound, which is more reliable than masterVolume.
+    // The base volumes are preserved as multipliers.
+    if (sounds.boom1) sounds.boom1.setVolume(0.5 * p5Volume);
+    if (sounds.boom2) sounds.boom2.setVolume(0.5 * p5Volume);
+    if (sounds.select) sounds.select.setVolume(1.0 * p5Volume);
+    if (sounds.selectEnemy) sounds.selectEnemy.setVolume(1.0 * p5Volume);
+    if (sounds.error) sounds.error.setVolume(0.7 * p5Volume);
+    if (sounds.move) sounds.move.setVolume(0.8 * p5Volume);
 }
 
 /**
@@ -415,36 +562,9 @@ class Hexagon {
     }
 
     draw(index, overrideColor = null, hoveredZone = null) {
-        // 1. Determine fill and stroke colors based on game state.
-        let fillColor = overrideColor || zoneColor[this.zone];
-        let strokeColor = color(0); // Default black
-        let sw = r / 18; // Default stroke weight
+        const { fillColor, strokeColor, sw } = this._getHexStyle(index, overrideColor, hoveredZone);
 
-        // Highlight for hovered zone (lowest priority)
-        if (gameState.zoneSelectionMode && hoveredZone === this.zone && gameState.selectedZone !== this.zone) {
-            // Use a subtle highlight for hover, like a slightly lighter fill.
-            fillColor = lerpColor(fillColor, color(255), 0.2);
-        }
-
-        // Highlight for selected zone (lower priority)
-        if (zoomInAnimationState.phase === 'inactive' && gameState.selectedZone === this.zone) {
-            strokeColor = color(255, 255, 0); // Yellow outline for selected zone
-            sw = 3;
-            // Darken the fill color to "shade" the selected zone.
-            fillColor = lerpColor(fillColor, color(0), 0.3);
-        }
-
-        if (zoomOutAnimationState.phase === 'inactive' && gameState.selected !== -1 && gameState.validMoves.has(index)) {
-            strokeColor = color(0, 106, 255); // Lighter blue for valid move
-            sw = 4;
-            fillColor = color(129, 133, 129); // Greenish fill for valid move
-        } else if (zoomOutAnimationState.phase === 'inactive' && gameState.selected === index) {
-            strokeColor = color(4, 0, 255); // Blue outline for selected
-            sw = 4;
-            fillColor = color(105, 101, 101); // Grey fill for selected
-        }
-
-        // 2. Apply styles and draw the hexagon shape.
+        // Apply styles and draw the hexagon shape.
         stroke(strokeColor);
         strokeWeight(sw);
         fill(fillColor);
@@ -458,6 +578,53 @@ class Hexagon {
         vertex(pos.x - r * sqrt(3) / 2, pos.y + r / 2);
         vertex(pos.x - r * sqrt(3) / 2, pos.y - r / 2);
         endShape(CLOSE);
+    }
+
+    /**
+     * @private
+     * Determines the correct styling for a hex based on the current game state.
+     * This centralizes the complex styling logic, separating it from the drawing command.
+     * @param {number} index - The index of this hex.
+     * @param {p5.Color | null} overrideColor - A color to use for animations.
+     * @param {number | null} hoveredZone - The zone the mouse is currently hovering over.
+     * @returns {{fillColor: p5.Color, strokeColor: p5.Color, sw: number}} The styling properties.
+     */
+    _getHexStyle(index, overrideColor, hoveredZone) {
+        let fillColor = overrideColor || zoneColor[this.zone];
+        let strokeColor = color(0); // Default black
+        let sw = r / 18; // Default stroke weight
+
+        // --- Determine style based on priority (highest priority checks last) ---
+
+        // Hovered zone highlight (lowest priority)
+        if (gameState.zoneSelectionMode && hoveredZone === this.zone && gameState.selectedZone !== this.zone) {
+            // The previous method of lightening the fill was too subtle on light-colored zones.
+            // A thick white stroke provides a much clearer and more consistent highlight.
+            strokeColor = color(255); // White outline for hover
+            sw = 3;
+        }
+
+        // Selected zone highlight
+        if (zoomInAnimationState.phase === 'inactive' && gameState.selectedZone === this.zone) {
+            strokeColor = color(255, 255, 0); // Yellow
+            sw = 3;
+            fillColor = lerpColor(fillColor, color(0), 0.3);
+        }
+
+        // Selected unit and valid moves (highest priority)
+        if (zoomOutAnimationState.phase === 'inactive' && gameState.selected !== -1) {
+            if (gameState.validMoves.has(index)) {
+                strokeColor = color(0, 106, 255); // Lighter blue for valid move
+                sw = 4;
+                fillColor = color(129, 133, 129); // Greenish fill for valid move
+            } else if (gameState.selected === index) {
+                strokeColor = color(4, 0, 255); // Blue outline for selected
+                sw = 4;
+                fillColor = color(105, 101, 101); // Grey fill for selected
+            }
+        }
+
+        return { fillColor, strokeColor, sw };
     }
 
     showCoordinates(index) {
@@ -731,8 +898,8 @@ function drawCannon(xHex, yHex, team, isWalking, aimingAngle = null) {
 
     // 2. Determine the rotation for the entire cannon graphic.
     // If an aiming angle is provided, use it. Otherwise, use a default "resting" angle.
-    // The resting angle of -PI/2 points the cannon straight up.
-    let rotation = (aimingAngle !== null) ? aimingAngle : -PI / 2;
+    // The resting angle of 0 points the cannon straight to the right.
+    let rotation = (aimingAngle !== null) ? aimingAngle : 0;
 
     // 3. Check if the cannon is pointing "backwards" (more than 90 degrees from straight right).
     // The angles for 6 o'clock and 12 o'clock are PI/2 and -PI/2 respectively.
@@ -801,23 +968,18 @@ function drawCannon(xHex, yHex, team, isWalking, aimingAngle = null) {
 function _getCannonAimingAngle(cannonIndex) {
     if (cannonIndex === null || cannonIndex === undefined) return null;
 
-    // 1. Check for player's live aiming preview or locked-in aim.
-    if (gameState.selected === cannonIndex) {
-        let directionIndex = null;
-        if (gameState.cannonIsAiming) {
-            // Aim is locked in, waiting for confirmation.
-            directionIndex = gameState.lockedAimingDirectionIndex;
-        } else if (gameState.lastAimingDirectionIndex !== null) {
-            // Live preview before the first click.
-            directionIndex = gameState.lastAimingDirectionIndex;
-        }
-
+    // 1. Check for player's LOCKED-IN aim (after the first click).
+    // If the player has clicked once to aim, the cannon should snap to that direction.
+    if (gameState.selected === cannonIndex && gameState.cannonIsAiming) {
+        const directionIndex = gameState.lockedAimingDirectionIndex;
         if (directionIndex !== null && CANNON_DIRECTIONS[directionIndex] !== undefined) {
             return CANNON_DIRECTIONS[directionIndex];
         }
     }
 
-    // 2. Check for a persistent threat set by any cannon (player or AI).
+    // 2. If not actively aiming, check for a persistent threat set by any cannon.
+    // This will be the cannon's direction before the first click, or its resting state
+    // after firing.
     if (gameState.cannonThreats.has(cannonIndex)) {
         const threatData = gameState.cannonThreats.get(cannonIndex);
         const directionIndex = threatData.directionIndex;
@@ -825,7 +987,8 @@ function _getCannonAimingAngle(cannonIndex) {
             return CANNON_DIRECTIONS[directionIndex];
         }
     }
-    // 3. If no aiming information is found, return null.
+    // 3. If no aiming or threat information is found, return null. This will cause
+    // the drawCannon function to use its default resting angle.
     return null;
 }
 
@@ -1026,10 +1189,32 @@ function _moveCannonThreat(fromIndex, toIndex) {
 function drawCannonTargetingUI() {
     // Part 1: Draw persistent threats from all cannons on the board.
 
+    // If the player is confirming a new target, draw the cannon's OLD threat area
+    // in a lighter, de-emphasized color first. This makes it clear which threat
+    // area will be replaced.
+    if (gameState.cannonIsAiming && gameState.cannonThreats.has(gameState.selected)) {
+        const threatData = gameState.cannonThreats.get(gameState.selected);
+        const baseColor = color(0, 0, 139); // Player's threat is always blue
+        const fadedColor = lerpColor(baseColor, color(220, 220, 220), 0.6); // Blend with light gray
+
+        stroke(fadedColor);
+        strokeWeight(4);
+        noFill();
+        for (const hexIndex of threatData.threatenedHexes) {
+            const hex = hexagon[hexIndex];
+            const pos = hexToXY(hex.xHex, hex.yHex);
+            drawMiniHexagon(pos.x, pos.y, r);
+        }
+    }
+
     // First, count how many cannons from each team threaten each hex. This allows us to
     // draw a thicker border for hexes threatened by multiple cannons.
     const threatsByHex = new Map();
     for (const [cannonIndex, threatData] of gameState.cannonThreats.entries()) {
+        // If we are aiming, skip the threat from the selected cannon because we just drew it separately.
+        if (gameState.cannonIsAiming && cannonIndex === gameState.selected) {
+            continue;
+        }
         // Only consider threats from active cannons, regardless of team.
         if (hexagon[cannonIndex].unit === 4) {
             const team = hexagon[cannonIndex].team;
@@ -1226,26 +1411,13 @@ function _getScoutMessageState() {
  */
 function drawScoutMessage() {
     const { show, lost } = _getScoutMessageState();
-
     if (!show) {
         return;
     }
-
     const message = !lost
         ? `Your scouts have encountered an archer sympathetic to your cause in the countryside beyond Zone ${gameState.secretArcherZone}.`
         : "Unfortunately, your scouts have lost track of the friendly archer.  Perhaps he will turn up again later.";
-    // Position the message vertically below the board.
-    const boardBottomY = 200 * boardScale;
-    const messageY = boardBottomY + 30 * boardScale; // Position below the board
-
-    fill(50, 50, 150); // A dark, strategic blue
-    textSize(14 * boardScale);
-    textAlign(CENTER, CENTER);
-
-    const boxWidth = width * 0.5;
-    const boxX = -boxWidth / 2;
-
-    text(message, boxX, messageY, boxWidth);
+    _drawBottomScreenMessage(message);
 }
 
 /**
@@ -1666,44 +1838,58 @@ function getWeightedRandom(options) {
  * The outcomes are based on the unit type being zoomed into, providing a
  * point-based advantage to the owner of that unit.
  */
-/**
 const ZOOM_IN_UNIT_CONFIG = {
-    // Archer (value: 3) -> Results in a point advantage of ~2.5-4
-    2: {
+    // Neutral Hex (unit: 0) -> Slight enemy advantage
+    0: {
         options: [
-            // Soldier-heavy outcome
+            { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
+            { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 2 },
+            { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
+            { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
+        ]
+    },
+    // Soldier Hex (unit: 1) -> ~+1 unit advantage for owner
+    1: {
+        // Options for when the PLAYER owns the soldier
+        player: [
+            { value: { player: { soldiers: 3 }, enemy: { soldiers: 2 } }, weight: 4 },
+            { value: { player: { soldiers: 2 }, enemy: { soldiers: 1 } }, weight: 3 },
+            { value: { player: { soldiers: 4 }, enemy: { soldiers: 2 } }, weight: 2 },
+            { value: { player: { soldiers: 1 }, enemy: { soldiers: 0 } }, weight: 1 }
+        ],
+        // Options for when the ENEMY owns the soldier
+        enemy: [
+            { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
+            { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 3 },
+            { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
+            { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
+        ]
+    },
+    // Archer Hex (unit: 2) -> ~+2.5-4 point advantage for owner
+    2: { // Archer
+        options: [
             { value: { player: { soldiers: 5 }, enemy: { soldiers: 1 } }, weight: 4 },
-            // Mixed force with cavalry
             { value: { player: { soldiers: 2, cavalry: 1 }, enemy: { soldiers: 1 } }, weight: 3, unlockFlag: 'hasBeenOnLevel2' },
-            // Direct carryover of the archer
             { value: { player: { archers: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 },
-            // Mixed force with a cannon, only available on higher levels
             { value: { player: { cannons: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 2, unlockFlag: 'hasBeenOnLevel5' }
         ]
     },
-    // Cavalry (value: 1.5) -> Results in a point advantage of ~1.5-2
-    3: {
+    // Cavalry Hex (unit: 3) -> ~+1.5-2 point advantage for owner
+    3: { // Cavalry
         options: [
-            // Soldier-heavy outcome
             { value: { player: { soldiers: 3 }, enemy: { soldiers: 1 } }, weight: 4 },
-            // Direct carryover of the cavalry
             { value: { player: { cavalry: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 }
         ]
     },
-    // Cannon (value: 2) -> Results in a point advantage of ~2-3
-    4: {
+    // Cannon Hex (unit: 4) -> ~+2-3 point advantage for owner
+    4: { // Cannon
         options: [
-            // Soldier-heavy outcome
             { value: { player: { soldiers: 4 }, enemy: { soldiers: 1 } }, weight: 4 },
-            // Mixed force with cavalry, available on most levels
             { value: { player: { soldiers: 2, cavalry: 1 }, enemy: { soldiers: 1 } }, weight: 3, unlockFlag: 'hasBeenOnLevel2' },
-            // Direct carryover of the cannon
             { value: { player: { cannons: 1, soldiers: 1 }, enemy: { soldiers: 1 } }, weight: 5 }
         ]
     }
 };
-
-
 /**
  * Generates the board state for a new, lower level by "zooming in" on a
  * specific zone from the current level.
@@ -1711,73 +1897,36 @@ const ZOOM_IN_UNIT_CONFIG = {
  * @returns {Array<{unit: number, team: number}>} An array representing the full board state.
  */
 function generateZoomInBoard(sourceZone) {
-    const boardState = [];
-    for (let i = 0; i < hexagon.length; i++) {
-        boardState[i] = { unit: 0, team: 0 };
-    }
-
-    // --- Define weighted probability tables for unit distribution ---
-    // These tables reflect the "power level" of the source hex, while also
-    // maintaining the principle that zoom-ins are slightly more difficult.
-
-    // For Soldier hexes (reflects a +2 advantage, penalized to ~+1)
-    const playerSoldierOptions = [
-        { value: { player: { soldiers: 3 }, enemy: { soldiers: 2 } }, weight: 4 },
-        { value: { player: { soldiers: 2 }, enemy: { soldiers: 1 } }, weight: 3 },
-        { value: { player: { soldiers: 4 }, enemy: { soldiers: 2 } }, weight: 2 },
-        { value: { player: { soldiers: 1 }, enemy: { soldiers: 0 } }, weight: 1 }
-    ];
-    const enemySoldierOptions = [
-        { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
-        { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 3 },
-        { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
-        { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
-    ];
-
-    // For Neutral hexes (slight enemy advantage, as per original design)
-    const neutralOptions = [
-        { value: { player: { soldiers: 2 }, enemy: { soldiers: 3 } }, weight: 4 },
-        { value: { player: { soldiers: 1 }, enemy: { soldiers: 2 } }, weight: 2 },
-        { value: { player: { soldiers: 2 }, enemy: { soldiers: 4 } }, weight: 2 },
-        { value: { player: { soldiers: 0 }, enemy: { soldiers: 1 } }, weight: 1 }
-    ];
+    const boardState = Array(hexagon.length).fill(null).map(() => ({ unit: 0, team: 0 }));
 
     // 1. Get the hexes from the source zone that we are zooming into.
     const sourceHexes = hexesByZone.get(sourceZone);
 
     // 2. Populate the new board zone by zone, using the pre-defined `mapsToNewZone` property.
-    // This is more robust than trying to calculate the mapping dynamically.
     for (const sourceHex of sourceHexes) {
         const newZoneNum = sourceHex.mapsToNewZone;
         if (!newZoneNum) continue; // Should not happen, but a good safeguard.
 
         const hexesInNewZone = hexesByZone.get(newZoneNum).map(h => hexagon.indexOf(h));
+        const unitConfig = ZOOM_IN_UNIT_CONFIG[sourceHex.unit];
+        if (!unitConfig) continue;
 
         let finalPackage;
-        const unitConfig = ZOOM_IN_UNIT_CONFIG[sourceHex.unit];
-
-        if (unitConfig) { // It's a special unit
+        if (sourceHex.unit === 0) { // Neutral hex
+            finalPackage = getWeightedRandom(unitConfig.options);
+        } else if (sourceHex.unit === 1) { // Soldier hex
+            const options = (sourceHex.team === PLAYER_TEAM) ? unitConfig.player : unitConfig.enemy;
+            finalPackage = getWeightedRandom(options);
+        } else { // Special unit hex (Archer, Cavalry, Cannon)
             const validOptions = unitConfig.options.filter(opt => !opt.unlockFlag || gameState[opt.unlockFlag]);
-            const basePackage = getWeightedRandom(validOptions);
-
+            const basePackage = getWeightedRandom(validOptions).value;
             if (sourceHex.team === PLAYER_TEAM) {
                 finalPackage = basePackage;
-            } else { // It's an AI special unit
-                // Swap the player and enemy packages...
+            } else { // It's an AI special unit, so swap the player/enemy rewards
                 finalPackage = { player: basePackage.enemy, enemy: basePackage.player };
-                // ...and add the AI difficulty bonus of 2 soldiers.
-                if (!finalPackage.enemy.soldiers) {
-                    finalPackage.enemy.soldiers = 0;
-                }
+                finalPackage.enemy.soldiers = (finalPackage.enemy.soldiers || 0);
                 finalPackage.enemy.soldiers += 2;
             }
-        } else if (sourceHex.unit === 1) { // It's a soldier
-           // Filter options based on whether the special unit has been unlocked.
-            // For soldiers, the options are pre-defined for each team, so no swap is needed.
-            finalPackage = getWeightedRandom(sourceHex.team === PLAYER_TEAM ? playerSoldierOptions : enemySoldierOptions);
-        } else { // It's a neutral hex
-            // Neutral hexes also have a pre-defined package.
-            finalPackage = getWeightedRandom(neutralOptions);
         }
 
         // Create a pool of units based on the chosen package.
@@ -1789,8 +1938,8 @@ function generateZoomInBoard(sourceZone) {
             for (let i = 0; i < (package.cannons || 0); i++) unitPool.push({ unit: 4, team: team });
         };
 
-        addUnitsToPool(PLAYER_TEAM, finalPackage.player);
-        addUnitsToPool(ENEMY_TEAM, finalPackage.enemy);
+        addUnitsToPool(PLAYER_TEAM, finalPackage.player || {});
+        addUnitsToPool(ENEMY_TEAM, finalPackage.enemy || {});
 
         // Fill the rest of the zone with empty hexes.
         while (unitPool.length < hexesInNewZone.length) unitPool.push({ unit: 0, team: 0 });
@@ -2209,9 +2358,10 @@ function executeAIMove(move) {
     if (move.type === 'set_threat') {
         // Recalculate the target group using the stored direction to ensure it's accurate.
         const targetGroup = _calculateCannonTargetGroupFromDirection(move.from, move.directionIndex);
-
+        
+        const duration = 60 * getZoomAnimationSpeedMultiplier();
         // We now pass the directionIndex directly.
-        gameState.animateCannonThreat = { cannonIndex: move.from, targetGroup: targetGroup, directionIndex: move.directionIndex, duration: 60 }; // 1 second
+        gameState.animateCannonThreat = { cannonIndex: move.from, targetGroup: targetGroup, directionIndex: move.directionIndex, duration: duration };
         // Mark the cannon as having fired this turn to prevent it from being used again.
         gameState.cannonsThatTargetedThisTurn.add(move.from);
         return;
@@ -2508,22 +2658,96 @@ function updateLayout() {
     // debugSkipLevelButton = new Button(endTurnButton.x, endTurnButton.y - mainButtonRadius * 2 - buttonSpacing, mainButtonRadius, "Skip to", "Level 5"); // DEBUG
     zoomOutButton = new Button(edgeMargin, edgeMargin, mainButtonRadius, "Zoom", "Out", 'out');
     zoomInButton = new Button(edgeMargin, edgeMargin + mainButtonRadius * 2 + buttonSpacing, mainButtonRadius, "Zoom", "In", 'in');
-    mainMenuButton = new Button(width - edgeMargin, edgeMargin, mainButtonRadius, "New", "Game", 'none', 'rectangle');
+    mainMenuButton = new Button(width - edgeMargin, edgeMargin, mainButtonRadius, "Options", null, 'none', 'rectangle');
 
     // Intro and Instructions Screen Buttons. Renamed for clarity.
     newGameButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Continue", null, 'none', 'rectangle');
     startButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "Start", null, 'none', 'rectangle');
 
-    // Difficulty adjustment buttons for the intro screen
-    const difficultyButtonRadius = 20 * boardScale;
-    // Position the difficulty selector on the left side of the screen, at the bottom.
-    // The UI's X coordinate is its center. We need to offset it from the left edge
-    // to make room for the "Set Difficulty:" text. This value is chosen to prevent
-    // overlap with the "Start" button on the right, especially on narrower screens.
-    const difficultyUiX = 200 * boardScale;
-    const difficultyUiY = height - edgeMargin; // Vertically align with start button
-    upArrowButton = new Button(difficultyUiX, difficultyUiY - (35 * boardScale), difficultyButtonRadius, "", null); // Position above center
-    downArrowButton = new Button(difficultyUiX, difficultyUiY + (35 * boardScale), difficultyButtonRadius, "", null); // Position below center
+    // Options Screen Buttons
+    optionsNewGameButton = new Button(width - edgeMargin, height - edgeMargin, mainButtonRadius, "New", "Game", 'none', 'rectangle');
+    // Position the "Back" button to the left of the "New Game" button at the bottom of the screen.
+    const backButtonX = optionsNewGameButton.x - (mainButtonRadius * 2) - buttonSpacing;
+    const backButtonY = optionsNewGameButton.y;
+    optionsBackButton = new Button(backButtonX, backButtonY, mainButtonRadius, "Back", "to Game", 'none', 'rectangle');
+
+// --- Instantiate Option Controls ---
+const controlCenterX = width / 2;
+const controlBlockCenterY = height / 2; // Center the block vertically to create space from the title
+const controlSpacing = 100 * boardScale;
+
+// Position the controls in a vertical stack.
+const volumeY = controlBlockCenterY - controlSpacing;
+const moveAnimY = controlBlockCenterY;
+const zoomAnimY = controlBlockCenterY + controlSpacing;
+
+// Zoom Animation Control
+zoomAnimationControl = new OptionControl(
+    "Zoom Animation",
+    controlCenterX,
+    zoomAnimY,
+    () => ANIMATION_SPEED_CONFIG[gameState.zoomAnimationSpeedSetting].label,
+    (direction) => {
+        const numSettings = ANIMATION_SPEED_CONFIG.length;
+        const current = gameState.zoomAnimationSpeedSetting;
+        if (direction === 'up') {
+            gameState.zoomAnimationSpeedSetting = (current + 1) % numSettings;
+        } else { // 'down'
+            gameState.zoomAnimationSpeedSetting = (current - 1 + numSettings) % numSettings;
+        }
+        // No need to call an update function, the multiplier is read live.
+    }
+);
+
+// Movement Animation Control
+movementAnimationControl = new OptionControl(
+    "Move Animation",
+    controlCenterX,
+    moveAnimY,
+    () => ANIMATION_SPEED_CONFIG[gameState.movementAnimationSpeedSetting].label,
+    (direction) => {
+        const numSettings = ANIMATION_SPEED_CONFIG.length;
+        const current = gameState.movementAnimationSpeedSetting;
+        if (direction === 'up') {
+            gameState.movementAnimationSpeedSetting = (current + 1) % numSettings;
+        } else { // 'down'
+            gameState.movementAnimationSpeedSetting = (current - 1 + numSettings) % numSettings;
+        }
+        updateAnimationSpeed(); // This updates the global animation loop size.
+    }
+);
+
+volumeControl = new OptionControl(
+    "Volume",
+    controlCenterX,
+    volumeY,
+    () => String(gameState.masterVolume),
+    (direction) => {
+        if (direction === 'up') {
+            gameState.masterVolume = min(gameState.masterVolume + 1, 10);
+        } else { // 'down'
+            gameState.masterVolume = max(gameState.masterVolume - 1, 0);
+        }
+        updateMasterVolume();
+    }
+);
+
+    // Difficulty adjustment control for the intro screen
+    const difficultyControlX = 200 * boardScale;
+    const difficultyControlY = height - edgeMargin;
+    difficultyControl = new OptionControl(
+        "Difficulty",
+        difficultyControlX,
+        difficultyControlY,
+        () => DIFFICULTY_LABELS[gameState.introScreenDifficulty],
+        (direction) => {
+            if (direction === 'up') {
+                gameState.introScreenDifficulty = min(gameState.introScreenDifficulty + 1, 10);
+            } else { // 'down'
+                gameState.introScreenDifficulty = max(gameState.introScreenDifficulty - 1, -5);
+            }
+        }
+    );
 
     // --- Pre-calculate layout values for the "Moves Left" UI ---
     // These values are used in `drawAvailableMovesUI` and only need to be
@@ -2620,6 +2844,7 @@ function setup() {
     }
     precalculateHexRanges(); // One-time calculation for performance
     precalculateCoordMap();
+    updateAnimationSpeed(); // Set animation speed based on loaded or default state.
 
     // Initialize colors (must be done in setup or draw in p5.js)
     zoneColor = [
@@ -2632,15 +2857,6 @@ function setup() {
         color(81, 191, 67),
         color(232, 42, 229)
     ];
-
-    // Adjust sound volumes for better balance.
-    // The "boom" sounds are loud, so they are reduced to make other sounds audible.
-    if (sounds.boom1) sounds.boom1.setVolume(0.5);
-    if (sounds.boom2) sounds.boom2.setVolume(0.5);
-    if (sounds.select) sounds.select.setVolume(1.0);
-    if (sounds.selectEnemy) sounds.selectEnemy.setVolume(1.0);
-    if (sounds.error) sounds.error.setVolume(0.7);
-    if (sounds.move) sounds.move.setVolume(0.8);
 
     teamColors = [
         {mainColor: color(245, 8, 8), secondaryColor: color(47, 0, 255)}, //dummy
@@ -2692,57 +2908,8 @@ function drawIntroScreen() {
     text("Battle for the", 0, -height * 0.21);
     text("Multiverse", 0, -height * 0.21 + subtitleLineHeight);
 
-    // Difficulty UI
-    const upArrowRelativeX = upArrowButton.x - (width / 2);
-    const upArrowRelativeY = upArrowButton.y - (height / 2);
-    const downArrowRelativeY = downArrowButton.y - (height / 2);
-
-    // --- Calculate text widths first for consistent spacing ---
-    const difficultyNumberText = String(gameState.introScreenDifficulty);
-    textSize(22 * boardScale); // Set size for the number to measure it
-    const numberWidth = textWidth(difficultyNumberText);
-    const spacing = 8 * boardScale; // A consistent spacing value
-    const difficultyNumberX = upArrowRelativeX;
-    const difficultyNumberY = (upArrowRelativeY + downArrowRelativeY) / 2;
-
-    // --- Draw "Set Difficulty:" text ---
-    fill(0);
-    textSize(22 * boardScale);
-    textAlign(RIGHT, CENTER);
-    // Position it to the left of the number's bounding box
-    text("Set Difficulty:", difficultyNumberX - (numberWidth / 2) - spacing, difficultyNumberY);
-
-    // --- Draw the difficulty number ---
-    textAlign(CENTER, CENTER);
-    textSize(22 * boardScale);
-    text(difficultyNumberText, difficultyNumberX, difficultyNumberY);
-
-    // --- Draw the difficulty label ---
-    const label = DIFFICULTY_LABELS[gameState.introScreenDifficulty];
-    if (label) {
-        fill(80);
-        textSize(22 * boardScale);
-        textAlign(LEFT, CENTER);
-        // Position it to the right of the number's bounding box
-        text(label, difficultyNumberX + (numberWidth / 2) + spacing, difficultyNumberY);
-    }
-
-    // Draw arrow buttons (they are drawn relative to center inside their own method)
-    upArrowButton.draw(true);
-    downArrowButton.draw(true);
-
-    // Manually draw solid triangles for arrows, as these buttons are simple circles
-    const arrowSize = 10 * boardScale;
-    const arrowColor = color(50);
-    fill(arrowColor);
-    noStroke();
-    triangle(difficultyNumberX, upArrowRelativeY - arrowSize,
-             difficultyNumberX - arrowSize, upArrowRelativeY + arrowSize,
-             difficultyNumberX + arrowSize, upArrowRelativeY + arrowSize);
-
-    triangle(difficultyNumberX, downArrowRelativeY + arrowSize,
-             difficultyNumberX - arrowSize, downArrowRelativeY - arrowSize,
-             difficultyNumberX + arrowSize, downArrowRelativeY - arrowSize);
+    // Difficulty Control
+    if (difficultyControl) difficultyControl.draw();
 
     // New Game Button
     newGameButton.draw(true); // Always active on intro screen
@@ -2786,6 +2953,34 @@ Zooming In allows you an opportunity to improve (or worsen!) your standing in a 
 
     // Start Button
     startButton.draw(true);
+    pop();
+}
+
+/**
+ * Draws the options screen.
+ */
+function drawOptionsScreen() {
+    push();
+    translate(width / 2, height / 2);
+
+    // Title
+    textAlign(CENTER, CENTER);
+    fill(0);
+    textStyle(BOLD);
+    textSize(50 * boardScale);
+    text("Options", 0, -height * 0.35);
+    textStyle(NORMAL);
+
+    // Draw the screen's buttons.
+    // The button's draw method handles converting its absolute coords to relative ones.
+    optionsBackButton.draw(true);
+    optionsNewGameButton.draw(true);
+
+    // Draw the new OptionControl instances
+    if (movementAnimationControl) movementAnimationControl.draw();
+    if (zoomAnimationControl) zoomAnimationControl.draw();
+    if (volumeControl) volumeControl.draw();
+
     pop();
 }
 
@@ -2843,21 +3038,22 @@ function drawZoomOutAnimationVisuals() {
 function updateZoomOutAnimationState() {
     // This function will eventually contain the entire switch statement.
     // For now, it handles the initial phases.
+    const multiplier = getZoomAnimationSpeedMultiplier();
     switch (zoomOutAnimationState.phase) {
         case 'shrinking':
-            const shrinkDuration = 60; // 1 second at 60fps
+            const shrinkDuration = 60 * multiplier;
             zoomOutAnimationState.progress += 1 / shrinkDuration;
             if (zoomOutAnimationState.progress >= 1) {
                 zoomOutAnimationState.progress = 1;
                 zoomOutAnimationState.phase = 'paused';
-                zoomOutAnimationState.pauseTimer = 30;
+                zoomOutAnimationState.pauseTimer = 30 * multiplier;
             }
             break;
         case 'paused':
             zoomOutAnimationState.pauseTimer--;
             if (zoomOutAnimationState.pauseTimer <= 0) {
                 zoomOutAnimationState.phase = 'revealing';
-                zoomOutAnimationState.revealTimer = 30; // Time until first reveal
+                zoomOutAnimationState.revealTimer = 30 * multiplier;
             }
             break;
         case 'revealing':
@@ -2871,10 +3067,10 @@ function updateZoomOutAnimationState() {
                         if (newUnitPresent && sounds.select) sounds.select.play();
                     }
                     zoomOutAnimationState.revealedZones++;
-                    zoomOutAnimationState.revealTimer = 30; // Reset timer for next reveal
+                    zoomOutAnimationState.revealTimer = 30 * multiplier; // Reset timer for next reveal
                 } else {
                     zoomOutAnimationState.phase = 'recoloring_pause';
-                    zoomOutAnimationState.revealTimer = 30; // "one more beat"
+                    zoomOutAnimationState.revealTimer = 30 * multiplier; // "one more beat"
                 }
             }
             break;
@@ -2884,7 +3080,7 @@ function updateZoomOutAnimationState() {
                 // Pause is over. The next draw will use the new colors.
                 // TODO: Maybe play a sound for the recolor.
                 zoomOutAnimationState.phase = 'final_reveal';
-                zoomOutAnimationState.revealTimer = 30; // Beat before outer zones appear.
+                zoomOutAnimationState.revealTimer = 30 * multiplier; // Beat before outer zones appear.
             }
             break;
         case 'final_reveal':
@@ -2898,7 +3094,7 @@ function updateZoomOutAnimationState() {
                 }
                 if (sounds.boom2) sounds.boom2.play();
                 zoomOutAnimationState.phase = 'complete';
-                zoomOutAnimationState.revealTimer = 60; // Show final board for 1 second.
+                zoomOutAnimationState.revealTimer = 60 * multiplier; // Show final board for 1 second.
             }
             break;
         case 'complete':
@@ -3127,7 +3323,8 @@ function drawMainGame() {
         drawZoomInAnimation();
     } else {
         // Determine the hovered zone before drawing the board, so the highlight can be passed down.
-        const hoveredHexIndex = findClickedHex();
+        // Use findClosestHexToMouse instead of findClickedHex to prevent "blinking" between hexes.
+        const hoveredHexIndex = findClosestHexToMouse();
         const hoveredZone = gameState.zoneSelectionMode && hoveredHexIndex !== -1 ? hexagon[hoveredHexIndex].zone : null;
 
         drawGameBoard(hoveredZone);
@@ -3157,6 +3354,8 @@ function draw() {
     } else if (gameState.currentScreen === 'instructions') {
         // --- Instructions Screen ---
         drawInstructionsScreen();
+    } else if (gameState.currentScreen === 'options') {
+        drawOptionsScreen();
     } else if (gameState.currentScreen === 'game') {
         // --- Main Game Screen ---
 
@@ -3218,8 +3417,9 @@ function drawTransitionBoard() { // Note: This is now only for the NEW board par
  */
 function drawZoomInAnimation() {
     // 1. State Update
-    const fadeDuration = 30; // 0.5s
-    const expandDuration = 60; // 1s
+    const multiplier = getZoomAnimationSpeedMultiplier();
+    const fadeDuration = 30 * multiplier;
+    const expandDuration = 60 * multiplier;
 
     if (zoomInAnimationState.phase === 'fading_out') {
         zoomInAnimationState.progress += 1 / fadeDuration;
@@ -3232,30 +3432,30 @@ function drawZoomInAnimation() {
         if (zoomInAnimationState.progress >= 1) {
             zoomInAnimationState.progress = 1;
             zoomInAnimationState.phase = 'recoloring';
-            zoomInAnimationState.recolorTimer = 30; // Wait ~0.5s before starting the recolor
+            zoomInAnimationState.recolorTimer = 30 * multiplier; // Wait ~0.5s before starting the recolor
         }
     } else if (zoomInAnimationState.phase === 'recoloring') {
         zoomInAnimationState.recolorTimer--;
         if (zoomInAnimationState.recolorTimer <= 0 && zoomInAnimationState.recoloredHexes < 7) {
             zoomInAnimationState.recoloredHexes++;
-            zoomInAnimationState.recolorTimer = 30; // ~0.5 second delay at 60fps
+            zoomInAnimationState.recolorTimer = 30 * multiplier; // ~0.5 second delay at 60fps
             if (sounds.select) sounds.select.play();
         } else if (zoomInAnimationState.recoloredHexes >= 7 && zoomInAnimationState.recolorTimer <= 0) {
             // Transition to the next phase after a short pause
             zoomInAnimationState.phase = 'revealing';
             zoomInAnimationState.recoloredHexes = 0; // Reuse this counter for the reveal
-            zoomInAnimationState.recolorTimer = 30; // Initial pause before first reveal
+            zoomInAnimationState.recolorTimer = 30 * multiplier; // Initial pause before first reveal
         }
     } else if (zoomInAnimationState.phase === 'revealing') {
         zoomInAnimationState.recolorTimer--;
         if (zoomInAnimationState.recolorTimer <= 0 && zoomInAnimationState.recoloredHexes < 7) {
             zoomInAnimationState.recoloredHexes++; // This now means "revealed new zones"
-            zoomInAnimationState.recolorTimer = 15; // A shorter delay between each zone reveal
+            zoomInAnimationState.recolorTimer = 15 * multiplier; // A shorter delay between each zone reveal
             if (sounds.boom2) sounds.boom2.play();
         } else if (zoomInAnimationState.recoloredHexes >= 7 && zoomInAnimationState.recolorTimer <= 0) {
             // All new zones are revealed. Transition to the final step.
             zoomInAnimationState.phase = 'finalizing';
-            zoomInAnimationState.recolorTimer = 60; // Pause to show the full new board
+            zoomInAnimationState.recolorTimer = 60 * multiplier; // Pause to show the full new board
         }
     } else if (zoomInAnimationState.phase === 'finalizing') {
         zoomInAnimationState.recolorTimer--;
@@ -3479,8 +3679,15 @@ function drawAnimation() {
  * @returns {number} The index of the clicked hexagon, or -1 if no hex was clicked.
  */
 function findClickedHex() {
+    // Calculate the scaled mouse coordinates once, before the loop, to avoid
+    // redundant calculations inside the check for every single hex.
+    const translatedMouseX = mouseX - (width / 2);
+    const translatedMouseY = mouseY - (height / 2);
+    const scaledMouseX = translatedMouseX / boardScale;
+    const scaledMouseY = translatedMouseY / boardScale;
+
     for (let i = 0; i < hexagon.length; i++) {
-        if (clickIsInCircle(hexagon[i].xHex, hexagon[i].yHex)) {
+        if (_isClickInCircle(scaledMouseX, scaledMouseY, hexagon[i])) {
             return i;
         }
     }
@@ -3511,6 +3718,14 @@ function findClosestHexToMouse() {
             minDistanceSq = distanceSq;
             closestIndex = i;
         }
+    }
+
+    // Define a maximum distance threshold. If the closest hex is still too far,
+    // treat it as if no hex was found. This prevents highlighting when the mouse
+    // is far from the board. A distance of 1.5 * r is a reasonable "tiny distance".
+    const maxDistance = r * 1.1;
+    if (minDistanceSq > maxDistance * maxDistance) {
+        return -1;
     }
     return closestIndex;
 }
@@ -3780,8 +3995,8 @@ function handleMenuScreenClick() {
             gameState.currentScreen = 'instructions';
             return;
         }
-        // Handle difficulty buttons only on the intro screen
-        if (handleDifficultyButtons()) {
+        // Handle difficulty control clicks
+        if (difficultyControl && difficultyControl.handleClicks()) {
             return;
         }
     } else if (gameState.currentScreen === 'instructions') {
@@ -3901,11 +4116,9 @@ function handleZoomButtons() {
 
 function handleMainMenuButton() {
     if (mainMenuButton && mainMenuButton.pressed()) {
-        // Return to the intro screen and clear the saved game.
-        // This allows the player to start a fresh game.
-        gameState = createDefaultGameState(); // Fully reset the game state
-        localStorage.removeItem('zoomBftmSaveState');
-        console.log("New game started. Previous save state cleared.");
+        // Switch to the options screen.
+        gameState.currentScreen = 'options';
+        if (sounds.select) sounds.select.play();
         return true;
     }
     return false;
@@ -3935,11 +4148,40 @@ function handleEndTurnButton() {
     return false;
 }
 
+/**
+ * Handles clicks on the Options screen.
+ */
+function handleOptionsScreenClick() {
+    if (optionsBackButton && optionsBackButton.pressed()) {
+        gameState.currentScreen = 'game';
+        if (sounds.select) sounds.select.play();
+        return true;
+    }
+
+    // Handle clicks for the new OptionControl instances
+    if (movementAnimationControl && movementAnimationControl.handleClicks()) return true;
+    if (zoomAnimationControl && zoomAnimationControl.handleClicks()) return true;
+    if (volumeControl && volumeControl.handleClicks()) return true;
+
+    if (optionsNewGameButton && optionsNewGameButton.pressed()) {
+        // This is the action that used to be on the main menu button.
+        // It returns to the intro screen and clears the saved game.
+        gameState = createDefaultGameState(); // Fully reset the game state
+        localStorage.removeItem('zoomBftmSaveState');
+        console.log("New game started. Previous save state cleared.");
+        // The default state's currentScreen is 'intro', so no need to set it here.
+        return true;
+    }
+    return false;
+}
+
 function mouseClicked() {
-    // This is a p5.js function to enable audio in browsers that block it by default.
-    // It needs to be called once after a user interaction (like a click) to allow sounds to play.
-    // It's safe to call this multiple times.
-    userStartAudio();
+    // On the first click, initialize the audio context and set the master volume.
+    if (!audioInitialized) {
+        userStartAudio();
+        updateMasterVolume(); // Apply the initial volume setting.
+        audioInitialized = true;
+    }
 
     // If the game is won, only check for the win screen button click and then stop.
     if (gameState.gameWon) {
@@ -3955,6 +4197,12 @@ function mouseClicked() {
     // Handle clicks on pre-game screens (intro, instructions)
     if (gameState.currentScreen === 'intro' || gameState.currentScreen === 'instructions') {
         handleMenuScreenClick();
+        return;
+    }
+
+    // Handle clicks on the new Options screen
+    if (gameState.currentScreen === 'options') {
+        handleOptionsScreenClick();
         return;
     }
 
@@ -3992,24 +4240,6 @@ function mouseClicked() {
 }
 
 /**
- * Handles clicks on the difficulty adjustment buttons.
- * @returns {boolean} True if a difficulty button was pressed, false otherwise.
- */
-function handleDifficultyButtons() {
-    if (upArrowButton.pressed()) {
-        gameState.introScreenDifficulty = min(gameState.introScreenDifficulty + 1, 10);
-        if (sounds.select) sounds.select.play();
-        return true;
-    }
-    if (downArrowButton.pressed()) {
-        gameState.introScreenDifficulty = max(gameState.introScreenDifficulty - 1, -5);
-        if (sounds.select) sounds.select.play();
-        return true;
-    }
-    return false;
-}
-
-/**
  * Saves the current game state to the browser's localStorage.
  */
 function saveGameState() {
@@ -4026,24 +4256,34 @@ function saveGameState() {
             revealMap: Array.from(zoomOutAnimationState.revealMap.entries()) // Convert Map to Array
         };
 
+        // Selectively build the gameState to save, excluding transient UI/animation state.
+        const gameStateToSave = {
+            selected: -1, // Always reset selection on load
+            zonesMovedFromThisTurn: Array.from(gameState.zonesMovedFromThisTurn),
+            isPlayerTurn: gameState.isPlayerTurn,
+            aiZonesMovedFromThisTurn: Array.from(gameState.aiZonesMovedFromThisTurn),
+            aiMovesMadeThisTurn: gameState.aiMovesMadeThisTurn,
+            introScreenDifficulty: gameState.introScreenDifficulty,
+            validMoves: [], // Always reset on load
+            currentScreen: gameState.currentScreen,
+            levelMemory: Array.from(gameState.levelMemory.entries()),
+            level: gameState.level,
+            gameWon: gameState.gameWon,
+            winRotation: gameState.winRotation,
+            hasBeenOnLevel5: gameState.hasBeenOnLevel5,
+            hasBeenOnLevel3: gameState.hasBeenOnLevel3,
+            hasBeenOnLevel2: gameState.hasBeenOnLevel2,
+            playerTurnCount: gameState.playerTurnCount,
+            scoutMessageShownOnLevels: Array.from(gameState.scoutMessageShownOnLevels),
+            cannonsThatTargetedThisTurn: Array.from(gameState.cannonsThatTargetedThisTurn),
+            cannonThreats: Array.from(gameState.cannonThreats.entries()),
+            movementAnimationSpeedSetting: gameState.movementAnimationSpeedSetting,
+            zoomAnimationSpeedSetting: gameState.zoomAnimationSpeedSetting,
+            masterVolume: gameState.masterVolume,
+        };
+
         const stateToSave = {
-            gameState: {
-                ...gameState,
-                // Convert Sets to Arrays for JSON serialization
-                zonesMovedFromThisTurn: Array.from(gameState.zonesMovedFromThisTurn),
-                aiZonesMovedFromThisTurn: Array.from(gameState.aiZonesMovedFromThisTurn),
-                validMoves: Array.from(gameState.validMoves),
-                scoutMessageShownOnLevels: Array.from(gameState.scoutMessageShownOnLevels), // prettier-ignore
-                cannonsThatTargetedThisTurn: Array.from(gameState.cannonsThatTargetedThisTurn),
-                cannonThreats: Array.from(gameState.cannonThreats.entries()),
-                // Convert the levelMemory Map to a serializable array of [key, value] pairs.
-                levelMemory: Array.from(gameState.levelMemory.entries()),
-                // We don't need to save the animation or click states
-                animationLoop: 0,
-                animateMovementFrom: null,
-                animateMovementTo: null,
-                badClick: 0,
-            },
+            gameState: gameStateToSave,
             hexState: hexState,
             DIFFICULTY: DIFFICULTY,
             zoomOutAnimationState: serializableZoomOutState,
@@ -4078,8 +4318,11 @@ function loadGameState() {
             return false;
         }
 
-        // Restore game state
+        // Restore game state.
+        // Start with a fresh default state and overwrite it with the saved data.
+        // This ensures any properties not in the save file are correctly initialized to their defaults (e.g., null instead of undefined).
         gameState = {
+            ...createDefaultGameState(),
             ...savedState.gameState,
             // Convert Arrays back to Sets
             zonesMovedFromThisTurn: new Set(savedState.gameState.zonesMovedFromThisTurn), // prettier-ignore
@@ -4092,6 +4335,12 @@ function loadGameState() {
             // Restore the levelMemory Map from its serialized array format.
             levelMemory: new Map(savedState.gameState.levelMemory || []),
         };
+
+        // Backwards compatibility for old saves with a single animation setting
+        if (savedState.gameState.animationSpeedSetting !== undefined) {
+            gameState.movementAnimationSpeedSetting = savedState.gameState.animationSpeedSetting;
+            gameState.zoomAnimationSpeedSetting = savedState.gameState.animationSpeedSetting;
+        }
 
         // Restore hex board
         for (let i = 0; i < hexagon.length; i++) {
